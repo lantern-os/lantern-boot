@@ -1,10 +1,10 @@
 # lantern-boot — Status
 
-**Phase:** 0 (Foundations) — design only.
+**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0004-phase-0-to-phase-1-transition.md); design complete, no code merged yet.
 
 ## Done
-- Boot flow and trust chain sketched ([ARCHITECTURE.md](./ARCHITECTURE.md)).
-- Boot-integrity threat model drafted.
+- Boot flow and trust chain sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
+- Boot-integrity threat model drafted and reviewed.
 
 ## Next
 - Decide the minimum required hardware root of trust.
