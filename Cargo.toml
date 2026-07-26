@@ -1,0 +1,21 @@
+[package]
+name = "lantern-boot"
+version = "0.0.0"
+edition = "2021"
+description = "LanternOS loader — Phase 1 prototype (RFC-0004)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-boot"
+path = "src/main.rs"
+
+[dependencies]
+lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
+lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
