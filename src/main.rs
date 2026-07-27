@@ -19,10 +19,13 @@
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
-use lantern_hal::Hal;
+use lantern_hal::{Hal, TrapFrame};
+use lantern_kernel::syscall::SyscallNumber;
 
 mod demo;
 mod entry;
+mod paging;
+mod pmm;
 mod uart;
 
 #[panic_handler]
@@ -37,6 +40,34 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+/// Wraps [`lantern_kernel::kernel_trap_handler`] to narrate the demo's syscalls
+/// on the console. Entirely S-mode code (every trap runs in S-mode, regardless
+/// of which privilege the interrupted thread was in) — unlike the thread bodies
+/// in `demo.rs`, it's free to use `println!`; see `demo.rs`'s module doc for why
+/// they can't. Prints the *incoming* request before dispatch (dispatch may
+/// switch `frame` to a different, newly-resumed thread's context) and the
+/// *outgoing* result after.
+fn boot_trap_handler(frame: &mut TrapFrame) {
+    let syscall = SyscallNumber::from_usize(frame.syscall_number());
+    let incoming_mr1 = frame.mr(1);
+
+    lantern_kernel::kernel_trap_handler(frame);
+
+    match syscall {
+        Some(SyscallNumber::Call) => {
+            println!("boot: client Call'd with payload {incoming_mr1}")
+        }
+        Some(SyscallNumber::Recv) => {
+            println!("boot: a Recv rendezvoused; receiver now has payload {}", frame.mr(1))
+        }
+        Some(SyscallNumber::Reply) => println!(
+            "boot: server Reply'd {incoming_mr1}; caller now resumed with reply {}",
+            frame.mr(1)
+        ),
+        _ => {}
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
     println!();
@@ -46,7 +77,7 @@ extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
     // SAFETY: called exactly once, here, before any trap can occur — the required
     // precondition on `install_trap_handler`.
     unsafe {
-        lantern_hal::Hardware::install_trap_handler(lantern_kernel::kernel_trap_handler);
+        lantern_hal::Hardware::install_trap_handler(boot_trap_handler);
     }
     println!("trap handler installed");
 

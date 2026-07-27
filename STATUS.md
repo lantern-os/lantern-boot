@@ -1,6 +1,6 @@
 # lantern-boot — Status
 
-**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0004-phase-0-to-phase-1-transition.md); `riscv64` loader boots and runs a real kernel IPC demo under QEMU.
+**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); `riscv64` loader boots and runs a real kernel IPC demo under QEMU.
 
 ## Done
 - Boot flow and trust chain sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
@@ -17,19 +17,41 @@
   `lantern-kernel`'s `KernelState` (an endpoint capability, two threads each with their own
   CSpace) and cold-starts the first thread. The client `Call`s the server over the
   endpoint; the server doubles the payload and `Reply`s. Confirmed under
-  `qemu-system-riscv64 -machine virt -bios default`, debug and release, stable over a 10s
-  run:
+  `qemu-system-riscv64 -machine virt -bios default`, debug and release:
   ```
-  boot: entering client thread
-  server: received 21
-  client: called with 21, got reply 42
+  boot: entering client thread (own page table, U-mode)
+  boot: client Call'd with payload 21
+  boot: a Recv rendezvoused; receiver now has payload 21
+  boot: server Reply'd 42; caller now resumed with reply 42
   ```
   This is the first real, hardware-level (QEMU) validation of the entire syscall/IPC
   pipeline — `lantern-hal` trap entry → `lantern-kernel` dispatch → trap exit — not just
-  unit tests against a fabricated `TrapFrame`.
-- Both "threads" run in the same address space at kernel privilege — Phase 1 has no
-  VSpace/paging yet, so there is no real isolation. This demonstrates the IPC *mechanism*,
-  not yet RFC-0004's "**confined** hello service."
+  unit tests against a fabricated `TrapFrame`. The thread bodies themselves can't
+  `println!` (see the next bullet), so `main.rs`'s `boot_trap_handler` narrates each
+  syscall from S-mode instead.
+- **Each thread now runs under its own Sv39 page table, in real U-mode** (`src/paging.rs`,
+  `src/pmm.rs`), using `lantern-hal`'s new `riscv64_paging` primitives
+  (`lantern-hal/STATUS.md`). Genuinely real: real address-space switching
+  (`activate_address_space` on every context switch), real U-mode execution (`sret` with
+  `sstatus.SPP/SPIE` cleared, verified by the demo's `ecall`s actually trapping from U-mode),
+  and real per-thread stack isolation (each thread's stack lives in its own region, mapped
+  only in its own table — confirmed absent from the other thread's). Not yet RFC-0004's
+  finish line: the shared *kernel* code is still mapped identically in both tables (no
+  separate user-program loader exists yet to keep it out) — see `paging.rs`'s module doc.
+  Two real bugs found and fixed getting here, both invisible to any unit test (neither
+  `lantern-hal`'s nor `lantern-kernel`'s host tests exercise a real hardware MMU):
+  - **S-mode can never fetch instructions from a U-accessible page** (RISC-V, unconditionally
+    — unlike loads/stores, `sstatus.SUM` doesn't override this for fetches). An earlier
+    revision mapped the *entire* kernel image U-accessible (for the threads' benefit), which
+    made every S-mode instruction fetch fault immediately after activating a thread's table,
+    including the trap vector re-faulting on its own entry forever. Fixed by splitting the
+    image: kernel code (trap vector, `lantern-kernel` dispatch, the `sret` cold-start path)
+    stays S-mode-only; only `demo.rs`'s thread bodies (`.user_text`, `linker.ld`) are
+    U-accessible.
+  - **A QEMU environment limitation with full 3-level Sv39 walks** — see
+    `lantern-hal/STATUS.md`'s entry for the full debugging record and `paging.rs`'s module
+    doc for the workaround (2 MiB megapages instead of 4 KiB pages) this crate now uses
+    throughout.
 - Extended `lantern_hal::Hal` with `initial_trap_frame`/`enter_thread` — primitives for
   starting a thread that has never trapped before, which didn't previously exist (only
   save/restore *around* a trap did). Implemented for `riscv64`, verified by disassembly and
@@ -62,6 +84,11 @@
   handling (i.e. once `lantern-hal` gains timer/interrupt-controller support).
 - Real physical memory discovery (from the DTB `boot_main` already receives) to back
   `lantern-kernel`'s `UntypedRetype` with actual memory instead of a count-based budget.
+- A real ELF loader for a separate user program, so the shared-kernel-code caveat above can
+  actually go away — the natural next step toward RFC-0004's "confined hello service."
+- Switch back to 4 KiB pages (`lantern-hal`'s `map`, already correct and host-tested) once
+  the QEMU 3-level-walk limitation is resolved — `map_megapage`'s 2 MiB granularity is a
+  documented environment workaround, not the intended long-term page size.
 
 ## Blocked on
 - Nothing for further `riscv64` loader work. `x86-64` boot and measured-boot/verification
