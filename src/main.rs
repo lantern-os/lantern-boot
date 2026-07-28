@@ -12,22 +12,41 @@
 //! `riscv64` only for now (the strategic target, ADR-0002) — `x86-64` boot is a
 //! separate, harder bring-up problem (real → protected → long mode) left as
 //! follow-up work, matching how `lantern-hal`'s trap entries were sequenced.
-#![no_std]
-#![no_main]
+//!
+//! `#![no_std]`/`#![no_main]` are conditional on `not(test)`, and every
+//! `riscv64`-only module/item below is gated on `target_arch = "riscv64"`
+//! (raw `ecall`/MMIO/linker-section code that simply cannot build for any other
+//! target) — the same pattern `lantern-hal`/`lantern-kernel` already use, applied
+//! here so [`elf`] (portable, hand-written ELF64 parsing — RFC-0008/ADR-0012) has
+//! real host-test coverage via `cargo test --target <host triple>` (this crate's
+//! own `.cargo/config.toml` still defaults *builds* to `riscv64gc-unknown-none-elf`,
+//! so the real boot binary is unaffected).
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use core::fmt::Write;
-use core::panic::PanicInfo;
+mod elf;
 
-use lantern_hal::{Hal, TrapFrame};
-use lantern_kernel::syscall::SyscallNumber;
-
-mod demo;
+#[cfg(target_arch = "riscv64")]
 mod entry;
-mod paging;
+#[cfg(target_arch = "riscv64")]
+mod loader;
+#[cfg(target_arch = "riscv64")]
 mod pmm;
+#[cfg(target_arch = "riscv64")]
 mod uart;
 
+#[cfg(target_arch = "riscv64")]
+use core::fmt::Write;
+#[cfg(target_arch = "riscv64")]
+use core::panic::PanicInfo;
+
+#[cfg(target_arch = "riscv64")]
+use lantern_hal::{Hal, TrapFrame};
+#[cfg(target_arch = "riscv64")]
+use lantern_kernel::syscall::SyscallNumber;
+
+#[cfg(target_arch = "riscv64")]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     let _ = writeln!(uart::Uart, "PANIC: {info}");
@@ -47,6 +66,7 @@ fn panic(info: &PanicInfo) -> ! {
 /// they can't. Prints the *incoming* request before dispatch (dispatch may
 /// switch `frame` to a different, newly-resumed thread's context) and the
 /// *outgoing* result after.
+#[cfg(target_arch = "riscv64")]
 fn boot_trap_handler(frame: &mut TrapFrame) {
     let syscall = SyscallNumber::from_usize(frame.syscall_number());
     let incoming_mr1 = frame.mr(1);
@@ -68,6 +88,7 @@ fn boot_trap_handler(frame: &mut TrapFrame) {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
     println!();
@@ -83,5 +104,5 @@ extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
 
     // SAFETY: called exactly once, here, immediately after installing the trap
     // handler and before anything else could trap.
-    unsafe { demo::run() }
+    unsafe { loader::run() }
 }

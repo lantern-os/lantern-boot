@@ -1,6 +1,6 @@
 # lantern-boot — Status
 
-**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); `riscv64` loader boots and runs a real kernel IPC demo under QEMU.
+**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); `riscv64` loader boots and, via a real ELF loader (RFC-0008/ADR-0012), runs two mutually confined, independently-built programs exchanging IPC under QEMU — RFC-0004's Phase 1 exit criterion.
 
 ## Done
 - Boot flow and trust chain sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
@@ -13,45 +13,60 @@
   "early console" HAL item; hardcoded to QEMU `virt`'s fixed UART0 address, kept clearly
   separate), and `boot_main` installing `lantern-kernel`'s trap handler via
   `lantern_hal::Hardware::install_trap_handler`.
-- **A real two-thread "hello service" demo** (`src/demo.rs`) directly populates
-  `lantern-kernel`'s `KernelState` (an endpoint capability, two threads each with their own
-  CSpace) and cold-starts the first thread. The client `Call`s the server over the
-  endpoint; the server doubles the payload and `Reply`s. Confirmed under
-  `qemu-system-riscv64 -machine virt -bios default`, debug and release:
+- **A real two-thread "hello service" demo, first with both threads compiled directly into
+  `lantern-boot`, later replaced entirely by a real ELF loader** (see below) — the earlier
+  revision directly populated `lantern-kernel`'s `KernelState` (an endpoint capability, two
+  threads each with their own CSpace) and cold-started the first thread; superseded, not
+  extended, once `src/loader.rs` landed. This is still the first real, hardware-level (QEMU)
+  validation of the entire syscall/IPC pipeline — `lantern-hal` trap entry → `lantern-kernel`
+  dispatch → trap exit — not just unit tests against a fabricated `TrapFrame`.
+- **Each loaded program now runs under its own Sv39 page table, in real U-mode**, using
+  `lantern-hal`'s `riscv64_paging` primitives (`lantern-hal/STATUS.md`). Genuinely real: real
+  address-space switching (`activate_address_space` on every context switch), real U-mode
+  execution (`sret` with `sstatus.SPP/SPIE` cleared), and real per-program stack isolation.
+  Two real bugs found and fixed getting here, both invisible to any unit test (neither
+  `lantern-hal`'s nor `lantern-kernel`'s host tests exercise a real hardware MMU) — since
+  superseded by the RFC-0008 work below but recorded here since they're still true:
+  - **S-mode can never fetch instructions from a U-accessible page** (RISC-V, unconditionally
+    — unlike loads/stores, `sstatus.SUM` doesn't override this for fetches). Every loaded
+    program's VSpace maps the shared kernel megapage S-mode-only (`loader.rs`'s
+    `map_kernel_shared`); only that program's own retyped Frames are U-accessible.
+  - **A QEMU environment limitation with full 3-level Sv39 walks** — see
+    `lantern-hal/STATUS.md`'s entry for the full debugging record. This crate uses 2 MiB
+    megapages (`FrameSize::Mega`, RFC-0008/ADR-0012) exclusively as the documented workaround.
+- **A real ELF loader** (`src/loader.rs`, `src/elf.rs` — [RFC-0008](../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
+  [ADR-0012](../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md)) replaces
+  the old demo entirely: `hello-service/` is a genuinely standalone riscv64 binary (its own
+  crate, own linker script, zero dependency on `lantern-hal`/`lantern-kernel` — it only ever
+  issues raw `ecall`s), embedded via `include_bytes!` (`assets/hello-service.elf` — rebuild
+  with `cd hello-service && cargo build --release`, then copy
+  `target/riscv64gc-unknown-none-elf/release/lantern-hello-service` over the checked-in
+  copy; not built automatically, see "Next"). `elf.rs` is a minimal, hand-written ELF64
+  parser (`PT_LOAD` only, strict header/bounds validation, a small explicit skip-list for
+  harmless-but-common segment types like `PT_GNU_STACK`, everything else rejected — no
+  external ELF-parsing crate, per RFC-0008's TCB-impact reasoning). `loader.rs` retypes real
+  VSpace/Frame capabilities (RFC-0008), maps each `PT_LOAD` segment and a stack Frame via
+  the real `FrameInvoke::Map` syscall path, and grants each loaded program's CSpace
+  *exactly* the shared endpoint capability it needs and nothing else — the actual "confined
+  hello service reachable only via a granted capability" RFC-0004 names as Phase 1's exit
+  criterion, loading the *same* binary twice (as server, then client, chosen by `arg0`) into
+  two mutually confined programs. Confirmed under `qemu-system-riscv64 -machine virt -bios
+  default`, from a clean rebuild, release profile:
   ```
-  boot: entering client thread (own page table, U-mode)
+  boot: entering client (loaded ELF, own VSpace, U-mode)
   boot: client Call'd with payload 21
   boot: a Recv rendezvoused; receiver now has payload 21
   boot: server Reply'd 42; caller now resumed with reply 42
   ```
-  This is the first real, hardware-level (QEMU) validation of the entire syscall/IPC
-  pipeline — `lantern-hal` trap entry → `lantern-kernel` dispatch → trap exit — not just
-  unit tests against a fabricated `TrapFrame`. The thread bodies themselves can't
-  `println!` (see the next bullet), so `main.rs`'s `boot_trap_handler` narrates each
-  syscall from S-mode instead.
-- **Each thread now runs under its own Sv39 page table, in real U-mode** (`src/paging.rs`,
-  `src/pmm.rs`), using `lantern-hal`'s new `riscv64_paging` primitives
-  (`lantern-hal/STATUS.md`). Genuinely real: real address-space switching
-  (`activate_address_space` on every context switch), real U-mode execution (`sret` with
-  `sstatus.SPP/SPIE` cleared, verified by the demo's `ecall`s actually trapping from U-mode),
-  and real per-thread stack isolation (each thread's stack lives in its own region, mapped
-  only in its own table — confirmed absent from the other thread's). Not yet RFC-0004's
-  finish line: the shared *kernel* code is still mapped identically in both tables (no
-  separate user-program loader exists yet to keep it out) — see `paging.rs`'s module doc.
-  Two real bugs found and fixed getting here, both invisible to any unit test (neither
-  `lantern-hal`'s nor `lantern-kernel`'s host tests exercise a real hardware MMU):
-  - **S-mode can never fetch instructions from a U-accessible page** (RISC-V, unconditionally
-    — unlike loads/stores, `sstatus.SUM` doesn't override this for fetches). An earlier
-    revision mapped the *entire* kernel image U-accessible (for the threads' benefit), which
-    made every S-mode instruction fetch fault immediately after activating a thread's table,
-    including the trap vector re-faulting on its own entry forever. Fixed by splitting the
-    image: kernel code (trap vector, `lantern-kernel` dispatch, the `sret` cold-start path)
-    stays S-mode-only; only `demo.rs`'s thread bodies (`.user_text`, `linker.ld`) are
-    U-accessible.
-  - **A QEMU environment limitation with full 3-level Sv39 walks** — see
-    `lantern-hal/STATUS.md`'s entry for the full debugging record and `paging.rs`'s module
-    doc for the workaround (2 MiB megapages instead of 4 KiB pages) this crate now uses
-    throughout.
+  `main.rs`'s `boot_trap_handler` narrates each syscall from S-mode, since the loaded
+  program itself can't `println!` (U-mode can't reach S-mode-only `fmt`/UART code any more
+  than S-mode can fetch from a U-accessible page).
+- **`src/main.rs`'s `#![no_std]`/`#![no_main]` are now conditional on `not(test)`**, and
+  every `riscv64`-only module is `#[cfg(target_arch = "riscv64")]`-gated (matching
+  `lantern-hal`/`lantern-kernel`'s existing pattern) — this crate's own build still defaults
+  to `riscv64gc-unknown-none-elf` (`.cargo/config.toml`), but `elf.rs` (portable, no
+  hardware dependency) now has real host-test coverage via
+  `cargo test --target <host triple>`.
 - Extended `lantern_hal::Hal` with `initial_trap_frame`/`enter_thread` — primitives for
   starting a thread that has never trapped before, which didn't previously exist (only
   save/restore *around* a trap did). Implemented for `riscv64`, verified by disassembly and
@@ -83,12 +98,23 @@
 - Root-cause the `wfi` crash properly, once there's a reason to need real `wfi`/interrupt
   handling (i.e. once `lantern-hal` gains timer/interrupt-controller support).
 - Real physical memory discovery (from the DTB `boot_main` already receives) to back
-  `lantern-kernel`'s `UntypedRetype` with actual memory instead of a count-based budget.
-- A real ELF loader for a separate user program, so the shared-kernel-code caveat above can
-  actually go away — the natural next step toward RFC-0004's "confined hello service."
+  `lantern-kernel`'s `Untyped` with a real memory map instead of one hardcoded
+  `pmm::GENERAL_MEMORY_BASE..GENERAL_MEMORY_END` range.
+- Automate rebuilding/embedding `assets/hello-service.elf` (a `build.rs` invoking `cargo
+  build` for `hello-service/` was considered and deliberately deferred — real, meaningful
+  nested-cross-compilation complexity for a manual step that's simple and rare today; revisit
+  if `hello-service/` starts changing often) — currently a documented manual step (see
+  "Done").
 - Switch back to 4 KiB pages (`lantern-hal`'s `map`, already correct and host-tested) once
   the QEMU 3-level-walk limitation is resolved — `map_megapage`'s 2 MiB granularity is a
   documented environment workaround, not the intended long-term page size.
+- A real cross-CNode capability-transfer primitive (`cnode::invoke`'s `Copy`/`Move` only
+  operate within a single CNode today) would let `loader.rs` grant the shared endpoint via a
+  real capability invocation instead of the one remaining direct pool write it still has —
+  a pre-existing Phase 1 gap RFC-0008 didn't touch, not new from this round.
+- A real root-task crate, and/or loading from a real block device instead of
+  `include_bytes!`, once `lantern-boot` needs to load more than one fixed program
+  (RFC-0008's "Future possibilities").
 
 ## Blocked on
 - Nothing for further `riscv64` loader work. `x86-64` boot and measured-boot/verification

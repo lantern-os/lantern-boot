@@ -1,0 +1,17 @@
+[package]
+name = "lantern-hello-service"
+version = "0.0.0"
+edition = "2021"
+description = "A minimal standalone riscv64 ELF binary, loaded by lantern-boot's ELF loader (RFC-0008/ADR-0012) -- proves real ELF loading, not a reusable component. Deliberately has zero dependencies, not even lantern-hal/lantern-kernel: it only ever issues raw ecalls."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-hello-service"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

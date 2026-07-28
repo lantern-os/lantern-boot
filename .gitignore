@@ -21,3 +21,6 @@ dist
 *.elf
 *.bin
 !**/docs/**/*.bin
+# This crate's ELF loader (RFC-0008/ADR-0012) embeds this real, intentionally
+# checked-in binary via include_bytes! -- not a local build artefact.
+!assets/hello-service.elf
