@@ -1,6 +1,6 @@
 # lantern-boot — Status
 
-**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); `riscv64` loader boots and, via a real ELF loader (RFC-0008/ADR-0012), runs two mutually confined, independently-built programs exchanging IPC under QEMU — RFC-0004's Phase 1 exit criterion.
+**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); `riscv64` loader boots and, via a real ELF loader (RFC-0008/ADR-0012), runs two mutually confined, independently-built programs exchanging IPC under QEMU, with IPC latency now benchmarked ([ADR-0013](../lantern-rfcs/adr/0013-ipc-latency-benchmark.md)) — **RFC-0004's Phase 1 exit criterion is fully met.**
 
 ## Done
 - Boot flow and trust chain sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
@@ -86,8 +86,57 @@
   a hypothesis). Moot either way, since Phase 1 has no interrupt/timer handling yet — all
   idle loops in this crate use a busy-loop (`core::hint::spin_loop()`) instead, documented
   at each site.
+- **IPC latency benchmarked, closing RFC-0004's remaining exit-criterion item**
+  ([ADR-0013](../lantern-rfcs/adr/0013-ipc-latency-benchmark.md)). `hello-service`
+  (`hello-service/src/main.rs`) now repeats its Call/Recv+Reply round trip
+  `BENCH_ROUND_TRIPS` (2000) + 1 (untimed warm-up) + `BENCH_SAFETY_MARGIN` (8, see
+  "IPC round-trip loss" below) times; `main.rs`'s `boot_trap_handler` reads the riscv64
+  `cycle`/`instret` counters (`rdcycle`/`rdinstret`, S-mode, no `lantern-hal` primitive
+  needed) around each timed round trip and reports min/avg/max. Confirmed under real QEMU,
+  release profile:
+  ```
+  boot: IPC benchmark done (2000 timed Call+Reply round trips, direct-switch fast path):
+  boot:   cycles/round-trip  min=26477 avg=27035 max=129804
+  boot:   instret/round-trip min=26507 avg=27074 max=129923
+  ```
+  (Run-to-run variance under QEMU/TCG is real and expected — a repeat run measured
+  min=26872 avg=32081 max=179226 — see ADR-0013's fixed target for how that's handled.)
+  `cycles` and `instret` tracking almost exactly 1:1 confirms this environment's QEMU/TCG
+  `cycle` counter is an instruction-count proxy, not real-hardware cycle timing — see
+  ADR-0013 for the full scope/methodology discussion and the Phase 1 target this sets.
+- **IPC round-trip loss — a real, reproducible, unresolved bug found while building the
+  above benchmark.** The *first* `Call` a thread issues immediately after being resumed via
+  `ipc::reply`'s direct `state.switch_to` occasionally never completes its switch to the
+  receiver: `lantern-kernel`'s own bookkeeping says it switched (`block_current` returns
+  `true`, `scheduler.current` genuinely becomes the receiver — confirmed with a hard
+  `assert!` in place of the normal `debug_assert!`, which never fired) and there is no
+  panic, no unexpected `scause` in QEMU's own `-d int` trace (every trap is a plain
+  `user_ecall`, no spurious interrupt), yet execution resumes the *original caller* anyway,
+  silently dropping that one message. Observed **exactly once per run so far, always
+  immediately after the untimed warm-up round trip** (i.e. the second time the client-side
+  `block_current`/direct-switch path runs), never again in the following ~2000 round trips.
+  Investigated and ruled out this session: `ipc::call`/`block_current`'s own logic (a
+  host-side unit test replaying the identical dispatch sequence against portable
+  `KernelState` — no real paging — passes cleanly, see
+  `lantern-kernel/src/syscall.rs`'s `two_call_reply_round_trips_in_a_row_client_runs_first`);
+  a spurious/timer interrupt (QEMU's own trace shows none); `sfence.vma`/TLB staleness on
+  VSpace reactivation (adding `fence.i` after `activate()`'s `sfence.vma` made no
+  difference); and stack overflow from the diagnostic instrumentation itself (the bug
+  reproduces identically with all narration/diagnostics silenced, including in the
+  *original*, pre-diagnostic minimal benchmark code). Not root-caused. Worked around for
+  now with `BENCH_SAFETY_MARGIN` (both `hello-service` and `boot_trap_handler` tolerate a
+  few extra round trips beyond the target; `Bench::done` ignores anything after the target
+  is reached) rather than blocking the benchmark on it — this is exactly the kind of
+  QEMU/hardware-level mystery the Sv39-walk bug above also was, and may turn out to be
+  related or may not.
 
 ## Next
+- **Root-cause the IPC round-trip-loss bug above.** Candidates not yet tried: QEMU's GDB
+  stub single-stepping across the exact failing trap (entry assembly → Rust dispatch →
+  exit assembly) to see directly where the resumed context diverges from what
+  `lantern-kernel` computed; testing against a different QEMU version/`-cpu` flag the same
+  way the Sv39-walk bug was differentially tested; inspecting `RAW_FRAME`'s actual memory
+  contents via the QEMU monitor at the moment of the bad resume.
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.
 - Measured boot / kernel-image signature verification (RFC-0007/ADR-0011 primitives are

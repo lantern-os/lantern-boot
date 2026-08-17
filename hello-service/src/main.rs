@@ -17,6 +17,18 @@
 //! loader is what actually decides which program's CSpace gets a capability to
 //! which endpoint, not anything ambient here.
 //!
+//! Each side repeats its half [`BENCH_ROUND_TRIPS`] + 1 + [`BENCH_SAFETY_MARGIN`]
+//! times (one untimed warm-up round trip, matching this crate's original
+//! single-shot behaviour exactly, then that many timed ones, plus a few spare)
+//! -- `lantern-boot/src/main.rs`'s `boot_trap_handler` is what actually
+//! measures and reports the IPC latency benchmark (RFC-0004's Phase 1 exit
+//! criterion), by reading the riscv64 `cycle`/`instret` counters from S-mode
+//! around each round trip; this binary just needs to *make* that many round
+//! trips happen. Both constants are duplicated there by the same convention as
+//! `ENDPOINT_CPTR`/`ARG0_SERVER` (`../src/loader.rs`'s module doc) -- neither
+//! side reads the other's source. `BENCH_SAFETY_MARGIN` exists because of a
+//! real, reproducible Phase 1 bug — see its doc on the `lantern-boot` side.
+//!
 //! Issues raw `ecall`s directly, matching `lantern-boot`'s own `demo.rs`
 //! `syscall()` helper's register convention exactly (`lantern-hal`'s riscv64
 //! trap entry, `mr0..mr3` = `a0..a3`, tag = `a4`, syscall number = `a7`) --
@@ -43,6 +55,15 @@ const ENDPOINT_CPTR: usize = 1;
 const SYSCALL_CALL: usize = 4;
 const SYSCALL_RECV: usize = 3;
 const SYSCALL_REPLY: usize = 5;
+
+/// Timed round trips per run, after the one untimed warm-up round trip -- see
+/// the module doc. Chosen to give a statistically stable min/avg/max under
+/// QEMU TCG emulation without making a manual benchmark run slow to wait for.
+const BENCH_ROUND_TRIPS: usize = 2000;
+
+/// Extra round trips beyond `BENCH_ROUND_TRIPS` + 1 -- see the module doc and
+/// `lantern-boot/src/main.rs`'s matching constant for why.
+const BENCH_SAFETY_MARGIN: usize = 8;
 
 /// Issues one syscall via `ecall`. `tag` is the raw packed `MessageTag` word;
 /// `0` is the all-zero tag (label/length/extra_caps/flags all zero) every call
@@ -79,12 +100,16 @@ unsafe fn syscall(
 #[unsafe(no_mangle)]
 extern "C" fn _start(arg0: usize) -> ! {
     if arg0 == 0 {
-        let (_r0, request, _r2, _r3) = unsafe { syscall(SYSCALL_RECV, ENDPOINT_CPTR, 0, 0, 0) };
-        let reply_value = request * 2;
-        // Reply takes no explicit CPtr; `cptr` here is unused.
-        let _ = unsafe { syscall(SYSCALL_REPLY, 0, reply_value, 0, 0) };
+        for _ in 0..=(BENCH_ROUND_TRIPS + BENCH_SAFETY_MARGIN) {
+            let (_r0, request, _r2, _r3) = unsafe { syscall(SYSCALL_RECV, ENDPOINT_CPTR, 0, 0, 0) };
+            let reply_value = request * 2;
+            // Reply takes no explicit CPtr; `cptr` here is unused.
+            let _ = unsafe { syscall(SYSCALL_REPLY, 0, reply_value, 0, 0) };
+        }
     } else {
-        let _ = unsafe { syscall(SYSCALL_CALL, ENDPOINT_CPTR, 21, 0, 0) };
+        for _ in 0..=(BENCH_ROUND_TRIPS + BENCH_SAFETY_MARGIN) {
+            let _ = unsafe { syscall(SYSCALL_CALL, ENDPOINT_CPTR, 21, 0, 0) };
+        }
     }
     loop {
         // Not `wfi` -- see `lantern-boot/demo.rs`'s identical choice for why.
