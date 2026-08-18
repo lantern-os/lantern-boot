@@ -1,6 +1,6 @@
 # lantern-boot — Status
 
-**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); `riscv64` loader boots and, via a real ELF loader (RFC-0008/ADR-0012), runs two mutually confined, independently-built programs exchanging IPC under QEMU, with IPC latency now benchmarked ([ADR-0013](../lantern-rfcs/adr/0013-ipc-latency-benchmark.md)) — **RFC-0004's Phase 1 exit criterion is fully met.**
+**Phase:** 1 (Microkernel prototype) — opened per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md), **closed** per [RFC-0009](../lantern-rfcs/rfcs/0009-phase-1-to-phase-2-transition.md)/[ADR-0014](../lantern-rfcs/adr/0014-phase-1-complete-phase-2-opened.md); `riscv64` loader boots and, via a real ELF loader (RFC-0008/ADR-0012), runs two mutually confined, independently-built programs exchanging IPC under QEMU, with IPC latency benchmarked ([ADR-0013](../lantern-rfcs/adr/0013-ipc-latency-benchmark.md)). This crate's own remaining "Next" items below (`x86-64` boot, DTB memory discovery, ...) continue as ordinary engineering work — the Roadmap's phase gate has moved on to Phase 2, this crate's Phase 1 backlog hasn't.
 
 ## Done
 - Boot flow and trust chain sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
