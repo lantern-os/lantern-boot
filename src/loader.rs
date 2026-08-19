@@ -17,14 +17,24 @@
 //! calls go through the actual capability checks a real syscall would, unlike
 //! the old direct-field-poke `Tcb.address_space` approach RFC-0008 retired).
 //!
-//! **What's still a direct pool poke, not a capability invocation:** placing the
-//! shared endpoint capability into each loaded program's own CSpace.
-//! `CNodeInvoke`'s `Copy`/`Move` only operate on slots *within a single CNode*
-//! (`cnode.rs`'s own module doc) — there is no cross-CNode transfer primitive
-//! yet, a pre-existing Phase 1 gap RFC-0008 didn't touch. Matches `demo.rs`'s
-//! old approach for exactly this one step; everything RFC-0008 actually
-//! introduced (VSpace/Frame retype, `FrameInvoke::Map`, `TCBConfigure`'s VSpace
-//! argument) goes through the real thing.
+//! **Placing the shared endpoint capability into each loaded program's own
+//! CSpace is now a real capability invocation, not a direct pool poke** —
+//! [RFC-0010](../../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md)
+//! added `CNodeInvoke::CopyCross` (`lantern_kernel::cnode`) for exactly this:
+//! copying a capability across two *different* CNodes the caller already holds
+//! capabilities to. This is deliberately **not** RFC-0010's other new
+//! mechanism, `crate::ipc`'s live `extra_caps == 1` transfer: that needs an
+//! already-running receiver to `Recv` with a registered destination slot, and a
+//! program's very first capability can't be bootstrapped that way — there's
+//! nothing to rendezvous on yet before it has *any* capability. `CopyCross` is
+//! the administrative counterpart that seeds it instead, gated the same way
+//! ordinary same-CNode `Copy` already is (holding a `Capability::CNode` is
+//! unrestricted access to everything in it — Phase 1's flat-CSpace model — for
+//! *both* CNodes named here). Root needs a capability to its own CNode to use
+//! it this way ([`SELF_CNODE_CPTR`]), seeded by the one remaining direct pool
+//! write left in this file: root's own founding identity, which — like its
+//! Untyped and TCB below — necessarily precedes any capability mechanism that
+//! could grant it one instead.
 //!
 //! **Per-segment memory is never identity-mapped** — a real, and until this
 //! session unexamined, consequence of loading two *separate* programs at the
@@ -39,11 +49,10 @@
 
 use lantern_hal::TrapFrame;
 use lantern_kernel::admin;
-use lantern_kernel::cap::{
-    Capability, CNode, CNodeId, CPtr, EndpointId, ObjectType, Rights, TcbId, UntypedId, VSpaceId,
-};
+use lantern_kernel::cap::{Capability, CNode, CNodeId, CPtr, ObjectType, Rights, TcbId, UntypedId, VSpaceId};
+use lantern_kernel::cnode;
 use lantern_kernel::frame::{self as frame_invoke, LABEL_MAP};
-use lantern_kernel::object::{Endpoint, SavedContext, Tcb, Untyped};
+use lantern_kernel::object::{SavedContext, Tcb, Untyped};
 use lantern_kernel::state::KernelState;
 
 use crate::elf;
@@ -72,6 +81,14 @@ const STACK_VADDR: usize = 0x8600_0000;
 const ARG0_SERVER: usize = 0;
 const ARG0_CLIENT: usize = 1;
 
+/// Root's own CNode capability, in its own CSpace — lets it name itself as
+/// `CopyCross`'s source-CNode argument (`cnode.rs`'s "self-administration ...
+/// requires that thread to actually hold a capability to its own CNode",
+/// exactly like `TCBConfigure`/every other self-administering operation).
+/// Placed here, not at [`ENDPOINT_CPTR`] (slot 1 in *loaded programs'* CSpaces
+/// — a different CNode entirely; no collision).
+const SELF_CNODE_CPTR: CPtr = 0;
+
 /// Retypes one object from `untyped_cptr` (in `root`'s own CSpace, per
 /// `admin::untyped_retype`'s contract) into `root`'s CSpace at `dest`, and
 /// returns the resulting capability. Panics on failure — this is trusted,
@@ -93,6 +110,35 @@ fn retype(
     admin::untyped_retype(state, root, untyped_cptr, &mut frame).expect("loader retype must succeed");
     let cspace = state.tcbs.get(root.0 as usize).unwrap().cspace.unwrap();
     state.cnodes.get(cspace.0 as usize).unwrap().get(dest).unwrap()
+}
+
+/// Mints an attenuated copy of `root`'s own capability at `src` (in its own
+/// CSpace) into `dest` (also its own CSpace), with `rights`/`badge` — a real
+/// `CNodeInvoke::Mint`, via [`SELF_CNODE_CPTR`], same trust tier as `retype`
+/// above.
+fn mint(state: &mut KernelState, root: TcbId, src: CPtr, dest: CPtr, rights: Rights, badge: u64) {
+    let packed = ((badge as usize) << 8) | rights.bits() as usize;
+    let mut frame = TrapFrame::zeroed();
+    frame.set_tag(lantern_hal::MessageTag { label: cnode::LABEL_MINT, length: 0, extra_caps: 0, flags: 0 });
+    frame.set_mr(1, src);
+    frame.set_mr(2, dest);
+    frame.set_mr(3, packed);
+    cnode::invoke(state, root, SELF_CNODE_CPTR, &mut frame).expect("loader mint must succeed");
+}
+
+/// Copies the capability at `source_slot` in the CNode named by `source_cnode`
+/// (a CPtr in `root`'s own CSpace) into `dest_slot` of the CNode named by
+/// `dest_cnode` (also a CPtr in `root`'s own CSpace) — a real
+/// `CNodeInvoke::CopyCross` (RFC-0010). See the module doc for why this, and
+/// not `crate::ipc`'s live transfer, is what places a loaded program's very
+/// first capability.
+fn copy_cross(state: &mut KernelState, root: TcbId, source_cnode: CPtr, source_slot: CPtr, dest_cnode: CPtr, dest_slot: CPtr) {
+    let mut frame = TrapFrame::zeroed();
+    frame.set_tag(lantern_hal::MessageTag { label: cnode::LABEL_COPY_CROSS, length: 0, extra_caps: 0, flags: 0 });
+    frame.set_mr(1, source_cnode);
+    frame.set_mr(2, source_slot);
+    frame.set_mr(3, dest_slot);
+    cnode::invoke(state, root, dest_cnode, &mut frame).expect("loader copy_cross must succeed");
 }
 
 /// Where OpenSBI loads/enters this image (`linker.ld`'s `BASE_ADDRESS`) — the
@@ -185,13 +231,13 @@ fn round_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
-/// Loads `elf_bytes` into a fresh VSpace and TCB, granting `endpoint` at
+/// Loads `elf_bytes` into a fresh VSpace and TCB, granting the capability at
+/// `root`'s own `endpoint_cptr` (in `root`'s own CSpace) into the new program's
 /// [`ENDPOINT_CPTR`] and nothing else, then admits it to the scheduler.
 /// `root`/`untyped_cptr` are the loader's own privileged identity (see the
 /// module doc); `next_slot` hands out fresh CSpace slots in `root`'s own
 /// CNode for this program's retyped objects (VSpace/Frames/CNode/Tcb/
-/// SchedContext all transiently live there — see the module doc's "still a
-/// direct pool poke" note for why the endpoint alone needs different handling).
+/// SchedContext, and the shared endpoint, all transiently live there).
 #[allow(clippy::too_many_arguments)]
 fn load(
     state: &mut KernelState,
@@ -199,7 +245,7 @@ fn load(
     untyped_cptr: CPtr,
     elf_bytes: &[u8],
     arg0: usize,
-    endpoint: Capability,
+    endpoint_cptr: CPtr,
     next_slot: &mut CPtr,
 ) -> TcbId {
     let header = elf::parse_header(elf_bytes).expect("hello-service.elf must parse");
@@ -274,11 +320,10 @@ fn load(
 
     let cnode_cptr = *next_slot;
     *next_slot += 1;
-    let Capability::CNode(cnode_id) = retype(state, root, untyped_cptr, ObjectType::CNode, cnode_cptr) else {
+    let Capability::CNode(_) = retype(state, root, untyped_cptr, ObjectType::CNode, cnode_cptr) else {
         panic!("expected a CNode capability");
     };
-    // Direct pool write for the endpoint capability -- see the module doc.
-    *state.cnodes.get_mut(cnode_id.0 as usize).unwrap().slot_mut(ENDPOINT_CPTR).unwrap() = endpoint;
+    copy_cross(state, root, SELF_CNODE_CPTR, endpoint_cptr, cnode_cptr, ENDPOINT_CPTR);
 
     let sched_cptr = *next_slot;
     *next_slot += 1;
@@ -323,6 +368,15 @@ pub unsafe fn run() -> ! {
     let root = TcbId(state.tcbs.alloc(Tcb::new()).expect("tcb pool exhausted") as u16);
     state.tcbs.get_mut(root.0 as usize).unwrap().cspace = Some(CNodeId(root_cnode_idx as u16));
 
+    // Root's own founding identity: a capability to its own CNode (so it can
+    // administer itself via real CNodeInvoke calls — see SELF_CNODE_CPTR's
+    // doc), and a memory-backed Untyped to retype everything else from. Both
+    // are direct pool writes, unavoidably — nothing capability-mediated could
+    // have granted root its very first capabilities either (the module doc's
+    // "necessarily precedes any capability mechanism" note).
+    *state.cnodes.get_mut(root_cnode_idx).unwrap().slot_mut(SELF_CNODE_CPTR).unwrap() =
+        Capability::CNode(CNodeId(root_cnode_idx as u16));
+
     let untyped = Untyped::with_memory(
         1000,
         pmm::GENERAL_MEMORY_BASE,
@@ -333,15 +387,38 @@ pub unsafe fn run() -> ! {
     *state.cnodes.get_mut(root_cnode_idx).unwrap().slot_mut(untyped_cptr).unwrap() =
         Capability::Untyped { id: UntypedId(untyped_idx as u16), rights: Rights::ALL };
 
-    let ep_idx = state.endpoints.alloc(Endpoint::new()).expect("endpoint pool exhausted");
-    let endpoint =
-        Capability::Endpoint { id: EndpointId(ep_idx as u16), badge: 42, rights: Rights::ALL };
+    let mut next_slot: CPtr = 2; // slot 0 is SELF_CNODE_CPTR, slot 1 is `untyped_cptr`.
 
-    let mut next_slot: CPtr = 2; // slot 1 is `untyped_cptr`.
-    let server =
-        load(state, root, untyped_cptr, HELLO_SERVICE_ELF, ARG0_SERVER, endpoint, &mut next_slot);
-    let client =
-        load(state, root, untyped_cptr, HELLO_SERVICE_ELF, ARG0_CLIENT, endpoint, &mut next_slot);
+    // A real, retyped Endpoint capability -- not a manually constructed value
+    // -- minted into a second, badged slot for this demo's own bookkeeping
+    // (the badge is never actually checked by anything on the receiving side,
+    // see `hello-service`'s own source, but a nonzero badge is more honest
+    // than the plain retype's default of 0).
+    let endpoint_plain_cptr = next_slot;
+    next_slot += 1;
+    retype(state, root, untyped_cptr, ObjectType::Endpoint, endpoint_plain_cptr);
+    let endpoint_badged_cptr = next_slot;
+    next_slot += 1;
+    mint(state, root, endpoint_plain_cptr, endpoint_badged_cptr, Rights::ALL, 42);
+
+    let server = load(
+        state,
+        root,
+        untyped_cptr,
+        HELLO_SERVICE_ELF,
+        ARG0_SERVER,
+        endpoint_badged_cptr,
+        &mut next_slot,
+    );
+    let client = load(
+        state,
+        root,
+        untyped_cptr,
+        HELLO_SERVICE_ELF,
+        ARG0_CLIENT,
+        endpoint_badged_cptr,
+        &mut next_slot,
+    );
     state.make_ready(server);
 
     crate::println!("boot: entering client (loaded ELF, own VSpace, U-mode)");

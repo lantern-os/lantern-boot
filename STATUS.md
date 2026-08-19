@@ -129,6 +129,34 @@
   is reached) rather than blocking the benchmark on it — this is exactly the kind of
   QEMU/hardware-level mystery the Sv39-walk bug above also was, and may turn out to be
   related or may not.
+- **`loader.rs`'s direct pool write is gone** — it now places each loaded program's shared
+  endpoint capability via `lantern-kernel`'s new `CNodeInvoke::CopyCross`
+  ([RFC-0010](../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md),
+  see `lantern-kernel/STATUS.md`), a real, capability-checked cross-CNode invocation instead
+  of a raw slot poke. Required giving root its own founding self-CNode capability
+  ([`SELF_CNODE_CPTR`]) so it can name itself as `CopyCross`'s source argument, and retyping
+  + minting the shared endpoint as a real capability (`ObjectType::Endpoint` retype, then
+  `CNodeInvoke::Mint` for its badge) rather than constructing a `Capability::Endpoint` value
+  by hand. **This was originally attempted with RFC-0010's *other* new mechanism (live
+  `extra_caps == 1` IPC transfer) and abandoned partway through**: that needs an
+  already-running receiver to `Recv` with a registered destination slot, but a program's
+  very first capability can't be bootstrapped that way — there's nothing to rendezvous on
+  before it has *any* capability (chicken-and-egg). `CopyCross` is the administrative
+  primitive that actually fits; `lantern-kernel/STATUS.md` has the full reasoning. Confirmed
+  under real QEMU, clean rebuild, release profile — same two mutually confined programs,
+  same full 2000-round-trip benchmark, unchanged behavior end to end:
+  ```
+  boot: entering client (loaded ELF, own VSpace, U-mode)
+  boot: client Call'd with payload 21
+  boot: a Recv rendezvoused; receiver now has payload 21
+  boot: server Reply'd 42; caller now resumed with reply 42
+  boot: warm-up round trip confirmed correct; benchmarking 2000 more IPC round trips...
+  boot: IPC benchmark done (2000 timed Call+Reply round trips, direct-switch fast path):
+  boot:   cycles/round-trip  min=26732 avg=27537 max=132939
+  boot:   instret/round-trip min=26754 avg=27549 max=133076
+  ```
+  `cargo clippy -D warnings` clean on host and `riscv64gc-unknown-none-elf` (debug and
+  release); the 8 host-side `elf.rs` tests (`cargo test --target <host triple>`) unaffected.
 
 ## Next
 - **Root-cause the IPC round-trip-loss bug above.** Candidates not yet tried: QEMU's GDB
