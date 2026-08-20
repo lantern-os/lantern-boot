@@ -129,6 +129,18 @@
   is reached) rather than blocking the benchmark on it — this is exactly the kind of
   QEMU/hardware-level mystery the Sv39-walk bug above also was, and may turn out to be
   related or may not.
+  **A second, distinct-looking manifestation found 2026-08-20** while building the
+  `broker_demo/` demo below: a thread parked mid-`Reply` (made ready via
+  `ipc::reply`'s own `state.make_ready(current)`, then only resumable later via a
+  *different* thread's own `block_current`/`Yield` — a path this project's existing
+  benchmark never actually exercises, since its server always re-enters `Recv` itself
+  immediately after being naturally rescheduled) never resumed at all, with no panic
+  and no further trap — confirmed via `[diag]` instrumentation showing the full
+  `Recv`→`Mint`→`Reply` sequence succeeding, then nothing further from that thread,
+  ever. Not investigated further (out of scope for that session's goal); the demo was
+  redesigned to route around it instead — see `broker_demo/main.rs`'s own trap-handler
+  doc for how and why. Recorded here because it's a new, real data point on the same
+  underlying class of bug, not because it's been root-caused.
 - **`loader.rs`'s direct pool write is gone** — it now places each loaded program's shared
   endpoint capability via `lantern-kernel`'s new `CNodeInvoke::CopyCross`
   ([RFC-0010](../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md),
@@ -157,14 +169,56 @@
   ```
   `cargo clippy -D warnings` clean on host and `riscv64gc-unknown-none-elf` (debug and
   release); the 8 host-side `elf.rs` tests (`cargo test --target <host triple>`) unaffected.
+- **A real, confined [RFC-0010](../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md)
+  capability-broker demo**, in a **second, fully isolated binary**
+  (`lantern-boot-broker-demo`, `src/broker_demo/`) — proving
+  [`lantern_capabilities::Broker`](../lantern-capabilities/src/lib.rs)'s sequence of
+  kernel operations for real, issuing genuine `ecall`s from confined U-mode under QEMU,
+  not just against a direct `KernelState`. Two new standalone programs (`broker-service/`,
+  `broker-client/`, same "zero dependency, raw `ecall`s" shape as `hello-service/`):
+  `broker-client` `Call`s `broker-service` registering its own reply-leg destination slot
+  (`tag.extra_caps == 2`); `broker-service` `Recv`s, `Mint`s an attenuated/badged copy of a
+  `Notification` it was granted at boot, and `Reply`s with it attached
+  (`tag.extra_caps == 1`); `broker-client` then `Signal`s the granted capability — the real
+  proof, since only a genuinely transferred, `WRITE`-rights capability can succeed there.
+  Confirmed under real QEMU, 3/3 reproducible runs:
+  ```
+  broker-demo: client Call'd the broker, registering its reply destination
+  broker-demo: broker Recv'd the client's request -- ok=true
+  broker-demo: broker Mint'd an attenuated, badged copy of its resource -- ok=true
+  broker-demo: broker Reply'd with the capability attached (extra_caps == 1) -- ok=true
+  broker-demo: client Signal'd the granted capability -- ok=true (the real proof: only a
+    genuinely transferred, WRITE-rights capability can succeed here)
+  ```
+  **Deliberately a second, isolated binary, not a third program merged into the existing
+  two-thread benchmark** (`lantern-boot`'s own `[[bin]]`) — that benchmark's trap handler
+  and cycle-counting narration are keyed only on syscall number, not which program issued
+  it, so an interleaved `Call`/`Reply` from this demo would have misattributed timing data
+  into its global `Bench` state. The two binaries share only the genuinely portable pieces
+  (`elf.rs`, `pmm.rs`, `uart.rs`, `entry.rs`) via `#[path]`, each compiled fresh into its
+  own separate crate root — real Cargo multi-`[[bin]]`, not code duplicated by hand.
+  `load()` in `broker_demo/loader.rs` generalises `../loader.rs`'s own (which only ever
+  grants one hardcoded capability) into an arbitrary `grants: &[(CPtr, CPtr)]` list, plus a
+  `self_cnode_dest` case that needed its own fix: granting a loaded program a capability to
+  *its own* CNode must source from *root's* freshly-retyped `cnode_cptr` (which names that
+  program's CNode), not from root's own unrelated self-reference — an actual bug caught and
+  fixed via the QEMU run itself (`Mint`/`Reply` both failed until corrected). See "Known
+  Phase 1 gaps" above for a new, real manifestation of the IPC round-trip-loss bug found
+  while building this, and how the demo's own design routes around it. `cargo clippy -D
+  warnings` clean on both binaries; existing `lantern-boot` binary's own build, clippy, host
+  tests, and full QEMU benchmark run all reconfirmed unaffected.
 
 ## Next
-- **Root-cause the IPC round-trip-loss bug above.** Candidates not yet tried: QEMU's GDB
-  stub single-stepping across the exact failing trap (entry assembly → Rust dispatch →
-  exit assembly) to see directly where the resumed context diverges from what
-  `lantern-kernel` computed; testing against a different QEMU version/`-cpu` flag the same
-  way the Sv39-walk bug was differentially tested; inspecting `RAW_FRAME`'s actual memory
-  contents via the QEMU monitor at the moment of the bad resume.
+- **Root-cause the IPC round-trip-loss bug above — now with a second, real manifestation
+  to compare against.** Candidates not yet tried: QEMU's GDB stub single-stepping across
+  the exact failing trap (entry assembly → Rust dispatch → exit assembly) to see directly
+  where the resumed context diverges from what `lantern-kernel` computed; testing against
+  a different QEMU version/`-cpu` flag the same way the Sv39-walk bug was differentially
+  tested; inspecting `RAW_FRAME`'s actual memory contents via the QEMU monitor at the
+  moment of the bad resume; comparing the two manifestations' actual trigger conditions
+  (this one's "parked mid-`Reply`, resumed via a *different* thread's `block_current`"
+  shape, vs. the original's "first `Call` right after a warm-up round trip") for anything
+  in common.
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.
 - Measured boot / kernel-image signature verification (RFC-0007/ADR-0011 primitives are
@@ -185,13 +239,19 @@
 - Switch back to 4 KiB pages (`lantern-hal`'s `map`, already correct and host-tested) once
   the QEMU 3-level-walk limitation is resolved — `map_megapage`'s 2 MiB granularity is a
   documented environment workaround, not the intended long-term page size.
-- A real cross-CNode capability-transfer primitive (`cnode::invoke`'s `Copy`/`Move` only
-  operate within a single CNode today) would let `loader.rs` grant the shared endpoint via a
-  real capability invocation instead of the one remaining direct pool write it still has —
-  a pre-existing Phase 1 gap RFC-0008 didn't touch, not new from this round.
 - A real root-task crate, and/or loading from a real block device instead of
   `include_bytes!`, once `lantern-boot` needs to load more than one fixed program
-  (RFC-0008's "Future possibilities").
+  (RFC-0008's "Future possibilities") — `broker_demo/loader.rs`'s own generalised `load()`
+  is a step in that direction but is still a second, separate, `include_bytes!`-based
+  loader, not a unification of the two.
+- Wire `lantern_capabilities::Broker`'s actual Rust API into a real confined program,
+  rather than `broker-service/`'s hand-written raw-`ecall` reimplementation of the same
+  sequence — not possible as a thin wrapper (`Broker`'s methods take `&mut KernelState`
+  directly, which no confined U-mode program can ever hold, see
+  `lantern-capabilities/STATUS.md`); would need either a genuine WASM/native confined
+  runtime capable of hosting real Rust service code, or accepting this demo's
+  hand-duplicated-logic approach as the durable pattern for confined services more
+  generally.
 
 ## Blocked on
 - Nothing for further `riscv64` loader work. `x86-64` boot and measured-boot/verification

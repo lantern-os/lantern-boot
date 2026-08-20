@@ -1,0 +1,17 @@
+[package]
+name = "lantern-broker-client"
+version = "0.0.0"
+edition = "2021"
+description = "A minimal standalone riscv64 ELF binary demonstrating a confined RFC-0010 capability client: Call's a broker registering a reply-leg destination slot, then Signal's the granted capability to prove it is real and functional. Loaded by lantern-boot's broker demo (src/broker_demo/). Deliberately zero dependencies, not even lantern-hal/lantern-kernel: it only ever issues raw ecalls."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-broker-client"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

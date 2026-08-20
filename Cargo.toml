@@ -10,6 +10,13 @@ publish = false
 name = "lantern-boot"
 path = "src/main.rs"
 
+[[bin]]
+# RFC-0010's confined-broker demo — a second, isolated binary (own entry
+# point, own trap handler); see src/broker_demo/loader.rs's module doc for
+# why it isn't a third program merged into the binary above.
+name = "lantern-boot-broker-demo"
+path = "src/broker_demo/main.rs"
+
 [dependencies]
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
 lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }

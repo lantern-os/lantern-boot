@@ -24,3 +24,8 @@ dist
 # This crate's ELF loader (RFC-0008/ADR-0012) embeds this real, intentionally
 # checked-in binary via include_bytes! -- not a local build artefact.
 !assets/hello-service.elf
+
+# Same reasoning, for lantern-boot-broker-demo's RFC-0010 confined-broker demo
+# (src/broker_demo/loader.rs).
+!assets/broker-service.elf
+!assets/broker-client.elf
