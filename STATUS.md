@@ -230,7 +230,10 @@
   handling (i.e. once `lantern-hal` gains timer/interrupt-controller support).
 - Real physical memory discovery (from the DTB `boot_main` already receives) to back
   `lantern-kernel`'s `Untyped` with a real memory map instead of one hardcoded
-  `pmm::GENERAL_MEMORY_BASE..GENERAL_MEMORY_END` range.
+  `pmm::GENERAL_MEMORY_BASE..GENERAL_MEMORY_END` range. Named a prerequisite by
+  [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
+  (Accepted): the launcher spawning several programs — each with its own VSpace, heap, and
+  Wasm memories — needs a real memory map.
 - Automate rebuilding/embedding `assets/hello-service.elf` (a `build.rs` invoking `cargo
   build` for `hello-service/` was considered and deliberately deferred — real, meaningful
   nested-cross-compilation complexity for a manual step that's simple and rare today; revisit
@@ -243,15 +246,19 @@
   `include_bytes!`, once `lantern-boot` needs to load more than one fixed program
   (RFC-0008's "Future possibilities") — `broker_demo/loader.rs`'s own generalised `load()`
   is a step in that direction but is still a second, separate, `include_bytes!`-based
-  loader, not a unification of the two.
+  loader, not a unification of the two. [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
+  (Accepted) makes this Phase 3's foundational work: the narrowing-waterfall loader gains
+  the ability to load N programs and place exactly the capabilities named by a launch
+  description into each CSpace via `CNodeInvoke::CopyCross`.
 - Wire `lantern_capabilities::Broker`'s actual Rust API into a real confined program,
   rather than `broker-service/`'s hand-written raw-`ecall` reimplementation of the same
   sequence — not possible as a thin wrapper (`Broker`'s methods take `&mut KernelState`
   directly, which no confined U-mode program can ever hold, see
-  `lantern-capabilities/STATUS.md`); would need either a genuine WASM/native confined
-  runtime capable of hosting real Rust service code, or accepting this demo's
-  hand-duplicated-logic approach as the durable pattern for confined services more
-  generally.
+  `lantern-capabilities/STATUS.md`).
+  [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
+  (Accepted) picks the answer: a new non-TCB `lantern-abi` crate (typed syscall wrappers +
+  a minimal `no_std` program runtime) is the substrate `Broker`/`Keystore`/`Store` are
+  rewritten onto, replacing `&mut KernelState` — not hand-duplicated logic.
 
 ## Blocked on
 - Nothing for further `riscv64` loader work. `x86-64` boot and measured-boot/verification
