@@ -1,6 +1,6 @@
 # lantern-boot — Status
 
-**Phase:** 1 (Microkernel prototype) — opened per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md), **closed** per [RFC-0009](../lantern-rfcs/rfcs/0009-phase-1-to-phase-2-transition.md)/[ADR-0014](../lantern-rfcs/adr/0014-phase-1-complete-phase-2-opened.md); `riscv64` loader boots and, via a real ELF loader (RFC-0008/ADR-0012), runs two mutually confined, independently-built programs exchanging IPC under QEMU, with IPC latency benchmarked ([ADR-0013](../lantern-rfcs/adr/0013-ipc-latency-benchmark.md)). This crate's own remaining "Next" items below (`x86-64` boot, DTB memory discovery, ...) continue as ordinary engineering work — the Roadmap's phase gate has moved on to Phase 3 (RFC-0017/ADR-0021), this crate's Phase 1 backlog hasn't.
+**Phase:** 1 (Microkernel prototype) — opened per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md), **closed** per [RFC-0009](../lantern-rfcs/rfcs/0009-phase-1-to-phase-2-transition.md)/[ADR-0014](../lantern-rfcs/adr/0014-phase-1-complete-phase-2-opened.md); `riscv64` loader boots and, via a real ELF loader (RFC-0008/ADR-0012), runs two mutually confined, independently-built programs exchanging IPC under QEMU, with IPC latency benchmarked ([ADR-0013](../lantern-rfcs/adr/0013-ipc-latency-benchmark.md)). This crate's own remaining "Next" items below (`x86-64` boot, 4 KiB pages, ...) continue as ordinary engineering work — the Roadmap's phase gate has moved on to Phase 3 (RFC-0017/ADR-0021), this crate's Phase 1 backlog hasn't.
 
 ## Done
 - Boot flow and trust chain sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
@@ -239,12 +239,20 @@
 - Decide the minimum required hardware root of trust (unchanged open question).
 - Root-cause the `wfi` crash properly, once there's a reason to need real `wfi`/interrupt
   handling (i.e. once `lantern-hal` gains timer/interrupt-controller support).
-- Real physical memory discovery (from the DTB `boot_main` already receives) to back
-  `lantern-kernel`'s `Untyped` with a real memory map instead of one hardcoded
-  `pmm::GENERAL_MEMORY_BASE..GENERAL_MEMORY_END` range. Named a prerequisite by
-  [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
-  (Accepted): the launcher spawning several programs — each with its own VSpace, heap, and
-  Wasm memories — needs a real memory map.
+- ~~Real physical memory discovery (from the DTB `boot_main` already receives)~~ —
+  **done 2026-09-06** (`src/fdt.rs`). A minimal, hand-written FDT reader (same
+  narrow-scope / from-scratch / bounds-checked discipline as `src/elf.rs`, per RFC-0008's
+  TCB-impact reasoning): validates the header, walks the structure block once, reads the
+  root's `#address-cells`/`#size-cells`, returns `(base, size)` from the first `/memory`
+  node's `reg`. `boot_main` (both binaries) reads it from the `a1` DTB pointer and passes
+  the RAM end to `loader::run`, which sizes its memory-backed `Untyped` from
+  `pmm::GENERAL_MEMORY_BASE` (still fixed — tied to `linker.ld`) up to the discovered end,
+  megapage-aligned. `pmm::GENERAL_MEMORY_END` is now only the fallback when the tree is
+  unreadable. 6 host tests (crafted DTBs: 2/2 and 1/1 cells, 64-bit fields, bad magic,
+  truncation, no-memory-node → error not guess). Confirmed under QEMU at `-m 64M`, `128M`
+  (default), `256M`, `512M` — the loader adapts; both demos still pass. This was the
+  prerequisite [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
+  named for the launcher (N programs, each with its own VSpace/heap/Wasm memories).
 - Automate rebuilding/embedding `assets/hello-service.elf` (a `build.rs` invoking `cargo
   build` for `hello-service/` was considered and deliberately deferred — real, meaningful
   nested-cross-compilation complexity for a manual step that's simple and rare today; revisit

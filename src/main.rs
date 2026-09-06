@@ -26,6 +26,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 mod elf;
+mod fdt;
 
 #[cfg(target_arch = "riscv64")]
 mod entry;
@@ -273,6 +274,24 @@ extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
     println!("LanternOS lantern-boot -- Phase 1 prototype");
     println!("hartid={hartid} dtb={dtb:#x}");
 
+    // Real physical-memory discovery from the device tree OpenSBI handed us in
+    // `a1` (`src/fdt.rs`), replacing `pmm.rs`'s hardcoded QEMU-`virt` guess. The
+    // loader's memory-backed `Untyped` spans `pmm::GENERAL_MEMORY_BASE` (fixed,
+    // tied to `linker.ld`'s kernel/`.user_text` placement) up to the end of the
+    // RAM the tree reports. If the tree is unreadable, fall back to the guess.
+    // SAFETY: `dtb` is the pointer OpenSBI passed in `a1` — a valid FDT blob.
+    let mem_end = match unsafe { fdt::ram_region(dtb as *const u8) } {
+        Some((base, size)) => {
+            let end = base.saturating_add(size);
+            println!("boot: DTB reports RAM {base:#x}..{end:#x}");
+            end as usize
+        }
+        None => {
+            println!("boot: DTB unreadable, using the hardcoded RAM end {:#x}", pmm::GENERAL_MEMORY_END);
+            pmm::GENERAL_MEMORY_END
+        }
+    };
+
     // SAFETY: called exactly once, here, before any trap can occur — the required
     // precondition on `install_trap_handler`.
     unsafe {
@@ -282,5 +301,5 @@ extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
 
     // SAFETY: called exactly once, here, immediately after installing the trap
     // handler and before anything else could trap.
-    unsafe { loader::run() }
+    unsafe { loader::run(mem_end) }
 }

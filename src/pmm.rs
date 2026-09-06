@@ -1,12 +1,13 @@
 //! Where this crate's real physical memory lives, as far as `loader.rs` needs to
 //! know it.
 //!
-//! **Phase 1 stand-in for real physical memory discovery.** Real discovery from
-//! the device tree `boot_main` already receives is still deferred
-//! (`STATUS.md`) — these are hardcoded facts about QEMU's `riscv64` `virt`
-//! machine at its default RAM size, the same kind of hardcoded-machine-fact
-//! this crate already relies on elsewhere (`uart.rs`'s fixed UART0 address,
-//! `linker.ld`'s kernel/`.user_text` megapage placement).
+//! [`GENERAL_MEMORY_BASE`] is a fixed fact tied to `linker.ld` (where the kernel
+//! image and `.user_text` megapages end); it isn't discovered. The **end** of
+//! RAM *is* now discovered — `boot_main` reads it from the device tree
+//! (`src/fdt.rs`) and passes it to `loader::run`. [`GENERAL_MEMORY_END`] below is
+//! only the fallback used when the tree is unreadable: hardcoded facts about
+//! QEMU's `riscv64` `virt` machine at its default RAM size, the same kind of
+//! hardcoded-machine-fact `uart.rs`'s fixed UART0 address is.
 //!
 //! [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
 //! [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md)
@@ -25,6 +26,7 @@
 /// linker-placed symbol doesn't guarantee.
 pub const GENERAL_MEMORY_BASE: usize = 0x8060_0000;
 
-/// End of `riscv_virt_board.ram` on QEMU's `virt` machine at its default size
-/// (128 MiB).
+/// Fallback end of RAM — `riscv_virt_board.ram` on QEMU's `virt` machine at its
+/// default size (128 MiB). Used only when `src/fdt.rs` can't read the device
+/// tree; the normal path is the tree-reported end.
 pub const GENERAL_MEMORY_END: usize = 0x8800_0000;

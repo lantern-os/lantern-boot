@@ -353,14 +353,17 @@ fn load(
 
 /// Sets up the loader's own privileged root identity (one CNode, one TCB never
 /// actually scheduled, one memory-backed Untyped spanning
-/// `pmm::GENERAL_MEMORY_BASE..GENERAL_MEMORY_END`), loads the hello-service ELF
-/// twice (server, then client — see the module doc), grants the shared endpoint
-/// to each, and cold-starts the client. Never returns.
+/// `pmm::GENERAL_MEMORY_BASE..mem_end`), loads the hello-service ELF twice
+/// (server, then client — see the module doc), grants the shared endpoint to
+/// each, and cold-starts the client. Never returns.
+///
+/// `mem_end` is the end of usable RAM — from `src/fdt.rs`'s device-tree read
+/// (`boot_main`), or `pmm::GENERAL_MEMORY_END` if the tree was unreadable.
 ///
 /// # Safety
 /// Must be called at most once, before any trap has occurred (this crate's boot
 /// code has exclusive access to kernel state at that point).
-pub unsafe fn run() -> ! {
+pub unsafe fn run(mem_end: usize) -> ! {
     // SAFETY: forwarded from this function's own contract.
     let state = unsafe { lantern_kernel::state::kernel_state() };
 
@@ -377,10 +380,14 @@ pub unsafe fn run() -> ! {
     *state.cnodes.get_mut(root_cnode_idx).unwrap().slot_mut(SELF_CNODE_CPTR).unwrap() =
         Capability::CNode(CNodeId(root_cnode_idx as u16));
 
+    // Clamp defensively: `mem_end` must be above the fixed low boundary and
+    // megapage-aligned down (`Untyped::with_memory`'s range requirement).
+    let mem_end = mem_end.max(pmm::GENERAL_MEMORY_BASE + lantern_hal::RISCV64_MEGAPAGE_SIZE)
+        & !(lantern_hal::RISCV64_MEGAPAGE_SIZE - 1);
     let untyped = Untyped::with_memory(
         1000,
         pmm::GENERAL_MEMORY_BASE,
-        pmm::GENERAL_MEMORY_END - pmm::GENERAL_MEMORY_BASE,
+        mem_end - pmm::GENERAL_MEMORY_BASE,
     );
     let untyped_idx = state.untypeds.alloc(untyped).expect("untyped pool exhausted");
     let untyped_cptr: CPtr = 1;

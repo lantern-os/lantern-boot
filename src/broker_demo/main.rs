@@ -19,6 +19,9 @@
 
 #[path = "../elf.rs"]
 mod elf;
+
+#[path = "../fdt.rs"]
+mod fdt;
 #[cfg(target_arch = "riscv64")]
 #[path = "../entry.rs"]
 mod entry;
@@ -106,6 +109,21 @@ extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
     println!("LanternOS lantern-boot-broker-demo -- RFC-0010 confined broker demo");
     println!("hartid={hartid} dtb={dtb:#x}");
 
+    // Real RAM discovery from the device tree (`src/fdt.rs`), same as
+    // `../main.rs`'s `boot_main`.
+    // SAFETY: `dtb` is the FDT pointer OpenSBI passed in `a1`.
+    let mem_end = match unsafe { fdt::ram_region(dtb as *const u8) } {
+        Some((base, size)) => {
+            let end = base.saturating_add(size) as usize;
+            println!("boot: DTB reports RAM {base:#x}..{end:#x}");
+            end
+        }
+        None => {
+            println!("boot: DTB unreadable, using the hardcoded RAM end {:#x}", pmm::GENERAL_MEMORY_END);
+            pmm::GENERAL_MEMORY_END
+        }
+    };
+
     // SAFETY: called exactly once, here, before any trap can occur.
     unsafe {
         lantern_hal::Hardware::install_trap_handler(broker_demo_trap_handler);
@@ -114,5 +132,5 @@ extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
 
     // SAFETY: called exactly once, here, immediately after installing the
     // trap handler and before anything else could trap.
-    unsafe { loader::run() }
+    unsafe { loader::run(mem_end) }
 }
