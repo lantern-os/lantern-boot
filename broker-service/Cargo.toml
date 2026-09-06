@@ -2,13 +2,21 @@
 name = "lantern-broker-service"
 version = "0.0.0"
 edition = "2021"
-description = "A minimal standalone riscv64 ELF binary demonstrating a confined RFC-0010 capability broker: Recv's a request, mints an attenuated/badged capability, Replies with it attached. Loaded by lantern-boot's broker demo (src/broker_demo/). Deliberately zero dependencies, not even lantern-hal/lantern-kernel: it only ever issues raw ecalls."
+description = "A minimal standalone riscv64 ELF binary demonstrating a confined RFC-0010 capability broker: Recv's a request, mints an attenuated/badged capability, Replies with it attached. Loaded by lantern-boot's broker demo (src/broker_demo/). Built on lantern-abi (RFC-0018/ADR-0022) — the non-TCB syscall-ABI crate — and nothing else."
 license = "MIT OR Apache-2.0"
 publish = false
 
 [[bin]]
 name = "lantern-broker-service"
 path = "src/main.rs"
+
+[dependencies]
+# Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/..."`
+# when pushing lantern-boot standalone (same split as lantern-kernel -> lantern-hal).
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+# default-features = false -> the confined `Abi` broker backend only; no lantern-kernel,
+# nothing from the TCB.
+lantern-capabilities = { git = "https://github.com/lantern-os/lantern-capabilities", branch = "main", default-features = false }
 
 [profile.dev]
 panic = "abort"

@@ -36,12 +36,20 @@
     megapages (`FrameSize::Mega`, RFC-0008/ADR-0012) exclusively as the documented workaround.
 - **A real ELF loader** (`src/loader.rs`, `src/elf.rs` — [RFC-0008](../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
   [ADR-0012](../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md)) replaces
-  the old demo entirely: `hello-service/` is a genuinely standalone riscv64 binary (its own
-  crate, own linker script, zero dependency on `lantern-hal`/`lantern-kernel` — it only ever
-  issues raw `ecall`s), embedded via `include_bytes!` (`assets/hello-service.elf` — rebuild
-  with `cd hello-service && cargo build --release`, then copy
+  the old demo entirely: `hello-service/` is a standalone riscv64 binary (its own crate, own
+  linker script), embedded via `include_bytes!` (`assets/hello-service.elf` — rebuild with
+  `cd hello-service && cargo build --release`, then copy
   `target/riscv64gc-unknown-none-elf/release/lantern-hello-service` over the checked-in
-  copy; not built automatically, see "Next"). `elf.rs` is a minimal, hand-written ELF64
+  copy; not built automatically, see "Next"). **Since 2026-09-01 it (and
+  `broker-service`/`broker-client`) issue syscalls through [`lantern-abi`](../lantern-abi)**
+  ([RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md))
+  — the one non-TCB crate that owns the `ecall` asm, the message-tag packing, the
+  `#[panic_handler]`, and `_start` (`lantern_abi::entry!`) — instead of each hand-rolling its
+  own. Their `Cargo.toml` `path` dep on `../../lantern-abi` needs the usual
+  path→`git` rewrite when pushing `lantern-boot` standalone (same as `lantern-kernel` →
+  `lantern-hal`). The broker demo and the hello-service benchmark produce identical output
+  under QEMU after the switch (benchmark `instret/round-trip min` unchanged within TCG
+  run-to-run variance). `elf.rs` is a minimal, hand-written ELF64
   parser (`PT_LOAD` only, strict header/bounds validation, a small explicit skip-list for
   harmless-but-common segment types like `PT_GNU_STACK`, everything else rejected — no
   external ELF-parsing crate, per RFC-0008's TCB-impact reasoning). `loader.rs` retypes real
@@ -172,15 +180,18 @@
 - **A real, confined [RFC-0010](../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md)
   capability-broker demo**, in a **second, fully isolated binary**
   (`lantern-boot-broker-demo`, `src/broker_demo/`) — proving
-  [`lantern_capabilities::Broker`](../lantern-capabilities/src/lib.rs)'s sequence of
-  kernel operations for real, issuing genuine `ecall`s from confined U-mode under QEMU,
-  not just against a direct `KernelState`. Two new standalone programs (`broker-service/`,
-  `broker-client/`, same "zero dependency, raw `ecall`s" shape as `hello-service/`):
-  `broker-client` `Call`s `broker-service` registering its own reply-leg destination slot
-  (`tag.extra_caps == 2`); `broker-service` `Recv`s, `Mint`s an attenuated/badged copy of a
-  `Notification` it was granted at boot, and `Reply`s with it attached
-  (`tag.extra_caps == 1`); `broker-client` then `Signal`s the granted capability — the real
-  proof, since only a genuinely transferred, `WRITE`-rights capability can succeed there.
+  [`lantern_capabilities::Broker`](../lantern-capabilities/src/lib.rs) for real from confined
+  U-mode under QEMU, not just against a direct `KernelState`. Two standalone programs
+  (`broker-service/`, `broker-client/`, same shape as `hello-service/` — since 2026-09-01
+  all three issue syscalls through [`lantern-abi`](../lantern-abi), not hand-rolled
+  `ecall`s): `broker-client` `Call`s `broker-service` registering its own reply-leg
+  destination slot (`tag.extra_caps == 2`); `broker-service` `Recv`s, then **runs the real
+  `lantern_capabilities::Broker`** (since 2026-09-05, via that crate's `Abi` backend,
+  `default-features = false` so nothing from the TCB is linked): `Broker::mint` (its own
+  `Rights::GRANT` policy check + a real `CNodeInvoke::Mint` + badge bookkeeping) then
+  `Broker::grant_via_reply` (`Reply` with the capability attached, `tag.extra_caps == 1`);
+  `broker-client` then `Signal`s the granted capability — the real proof, since only a
+  genuinely transferred, `WRITE`-rights capability can succeed there.
   Confirmed under real QEMU, 3/3 reproducible runs:
   ```
   broker-demo: client Call'd the broker, registering its reply destination
@@ -250,15 +261,14 @@
   (Accepted) makes this Phase 3's foundational work: the narrowing-waterfall loader gains
   the ability to load N programs and place exactly the capabilities named by a launch
   description into each CSpace via `CNodeInvoke::CopyCross`.
-- Wire `lantern_capabilities::Broker`'s actual Rust API into a real confined program,
-  rather than `broker-service/`'s hand-written raw-`ecall` reimplementation of the same
-  sequence — not possible as a thin wrapper (`Broker`'s methods take `&mut KernelState`
-  directly, which no confined U-mode program can ever hold, see
-  `lantern-capabilities/STATUS.md`).
-  [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
-  (Accepted) picks the answer: a new non-TCB `lantern-abi` crate (typed syscall wrappers +
-  a minimal `no_std` program runtime) is the substrate `Broker`/`Keystore`/`Store` are
-  rewritten onto, replacing `&mut KernelState` — not hand-duplicated logic.
+- ~~Wire `lantern_capabilities::Broker`'s actual Rust API into a real confined program~~ —
+  **done 2026-09-05.** `Broker` now has a `BrokerBackend` trait with an `Abi` (confined,
+  `lantern-abi`-only) and a `KernelBackend` (`&mut KernelState`) impl;
+  [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md).
+  `broker-service` constructs a real `Broker` with the `Abi` backend and runs its `mint` /
+  `grant_via_reply` under QEMU. `Keystore`/`Store` still thread a `KernelBackend` internally
+  — moving *their* logic (and request/reply wire protocols) into confined programs is the
+  remaining ADR-0022 Part 1 work.
 
 ## Blocked on
 - Nothing for further `riscv64` loader work. `x86-64` boot and measured-boot/verification

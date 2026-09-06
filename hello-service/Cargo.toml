@@ -2,13 +2,18 @@
 name = "lantern-hello-service"
 version = "0.0.0"
 edition = "2021"
-description = "A minimal standalone riscv64 ELF binary, loaded by lantern-boot's ELF loader (RFC-0008/ADR-0012) -- proves real ELF loading, not a reusable component. Deliberately has zero dependencies, not even lantern-hal/lantern-kernel: it only ever issues raw ecalls."
+description = "A minimal standalone riscv64 ELF binary, loaded by lantern-boot's ELF loader (RFC-0008/ADR-0012) -- proves real ELF loading and drives the IPC latency benchmark. Built on lantern-abi (RFC-0018/ADR-0022) -- the non-TCB syscall-ABI crate -- and nothing else."
 license = "MIT OR Apache-2.0"
 publish = false
 
 [[bin]]
 name = "lantern-hello-service"
 path = "src/main.rs"
+
+[dependencies]
+# Local path in this monorepo; rewrite to `git = "https://github.com/lantern-os/lantern-abi"`
+# when pushing lantern-boot standalone (same split as lantern-kernel -> lantern-hal).
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
 
 [profile.dev]
 panic = "abort"
