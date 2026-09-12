@@ -28,16 +28,23 @@
 //! loader would have panicked the instant a loaded binary's segment crossed
 //! 2 MiB.
 //!
-//! **Still out of scope here: a shared `Frame` mapped into two VSpaces at
-//! once**, which the RFC-0019 service-call transport needs. `lantern-kernel`'s
-//! `Frame` object is capped at exactly one mapping
-//! (`lantern-kernel/src/object.rs`'s `Frame::mapped_at` doc: "Phase 1 has no
-//! shared-frame IPC yet, so a Frame has at most one mapping, full stop"). That
-//! is a kernel object-model change, not a loader one — ADR-0022's Part 2, left
-//! for its own round. This module's `load` does gain a per-program **heap**
-//! region (an ordinary, non-shared private Frame range, same as the stack) —
-//! generalizing "give a loaded program its own scratch memory" beyond just a
-//! stack, which every future confined service will want regardless of Part 2.
+//! **[`map_shared_frame`] is ADR-0022 Part 2**: one 4 KiB `Frame`, mapped
+//! read/write into two already-loaded programs' VSpaces at once — the
+//! RFC-0019 shared `(runtime, service)` channel. `lantern-kernel`'s `Frame`
+//! object used to cap out at exactly one mapping; `MAX_FRAME_MAPPINGS == 2`
+//! (`lantern-kernel/src/object.rs`) now allows exactly this case and no more.
+//! Neither program needs a capability to the Frame itself — this project's
+//! memory model needs none to *use* an already-mapped page (RFC-0008): the
+//! launcher (root) retains the one `Capability::Frame` throughout and invokes
+//! `Map` on it twice, once per target VSpace; each program just reads/writes
+//! its own mapped virtual address, exactly like its stack. [`load`] returns
+//! each program's `vspace_cptr` (via [`LoadedProgram`]) so a caller has
+//! something to pass here after loading.
+//!
+//! This module's `load` also gained a per-program **heap** region (an
+//! ordinary, non-shared private Frame range, same as the stack) — generalizing
+//! "give a loaded program its own scratch memory" beyond just a stack, which
+//! every future confined service wants regardless of the shared `Frame`.
 
 use lantern_hal::TrapFrame;
 use lantern_kernel::admin;
@@ -99,6 +106,16 @@ pub struct ProgramSpec<'a> {
 /// module uses slot 0 for it, by convention established when `loader.rs`
 /// first needed to name itself as `CopyCross`'s source-CNode argument.
 pub const SELF_CNODE_CPTR: CPtr = 0;
+
+/// What [`load`] hands back: the new program's [`TcbId`] (to `make_ready` or
+/// `enter_first_thread`) and its `vspace_cptr` (in `root`'s own CSpace) — the
+/// latter needed only by a caller that goes on to [`map_shared_frame`] this
+/// program into a shared channel with another one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LoadedProgram {
+    pub tcb: TcbId,
+    pub vspace_cptr: CPtr,
+}
 
 /// Retypes one object from `untyped_cptr` (in `root`'s own CSpace, per
 /// `admin::untyped_retype`'s contract) into `root`'s CSpace at `dest`, and
@@ -212,7 +229,7 @@ pub fn map(state: &mut KernelState, root: TcbId, frame_cptr: CPtr, vspace_cptr: 
 /// are the launcher's own privileged identity; `next_slot` hands out fresh
 /// CSpace slots in `root`'s own CNode for this program's retyped objects
 /// (VSpace/Frames/CNode/Tcb/SchedContext all transiently live there).
-pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &ProgramSpec, next_slot: &mut CPtr) -> TcbId {
+pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &ProgramSpec, next_slot: &mut CPtr) -> LoadedProgram {
     let header = elf::parse_header(spec.elf_bytes).expect("loaded ELF must parse");
 
     let vspace_cptr = *next_slot;
@@ -225,16 +242,12 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
 
     let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
 
-    for i in 0..header.phnum {
-        let Some(ph) = elf::program_header(spec.elf_bytes, &header, i).expect("loaded ELF program header") else {
-            continue; // A harmless-to-skip segment type (elf.rs's module doc).
-        };
-        let seg_start = round_down(ph.vaddr as usize, mega);
-        let seg_end = round_up(ph.vaddr as usize + ph.memsz as usize, mega);
-        let file_start = ph.vaddr as usize;
-        let file_end = file_start + ph.filesz as usize;
+    /// Generous for a small, hand-linked demo binary: a handful of segments
+    /// (.text/.rodata/.data), each at most a couple of megapages.
+    const MAX_PROGRAM_MEGAPAGES: usize = 8;
 
-        let mut perms = 0usize;
+    fn segment_perms(ph: &elf::ProgramHeader) -> usize {
+        let mut perms = PERM_U;
         if ph.flags & elf::PF_R != 0 {
             perms |= PERM_R;
         }
@@ -244,46 +257,105 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
         if ph.flags & elf::PF_X != 0 {
             perms |= PERM_X;
         }
-        perms |= PERM_U;
+        perms
+    }
 
-        // One `FrameMega` per 2 MiB step across the segment's range — not
-        // just one, so a segment spanning more than one megapage loads
-        // correctly instead of tripping an `assert_eq!` (see the module doc).
-        let mut frame_vaddr = seg_start;
-        while frame_vaddr < seg_end {
-            let frame_cptr = *next_slot;
-            *next_slot += 1;
-            let Capability::Frame { id: frame_id, .. } =
-                retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr)
-            else {
-                panic!("expected a Frame capability");
-            };
-            let paddr = state.frames.get(frame_id.0 as usize).unwrap().paddr;
+    // Pass 1: the *set* of unique megapages this ELF's segments touch, each
+    // with the union of every segment's own permission bits that lands in
+    // it. Two segments sharing one megapage is real and common (a small
+    // binary's .text and .rodata are often only a few KiB apart, well within
+    // the same 2 MiB page) — mapping the same virtual address twice would
+    // fail (`FrameInvoke::Map` refuses re-mapping an occupied address), and
+    // mapping it once under only the *first* segment's permissions could
+    // under-permission whatever the second segment needed.
+    let mut megapage_vaddr = [0usize; MAX_PROGRAM_MEGAPAGES];
+    let mut megapage_perms = [0usize; MAX_PROGRAM_MEGAPAGES];
+    let mut megapage_count = 0usize;
+    for i in 0..header.phnum {
+        let Some(ph) = elf::program_header(spec.elf_bytes, &header, i).expect("loaded ELF program header") else {
+            continue; // A harmless-to-skip segment type (elf.rs's module doc).
+        };
+        let seg_start = round_down(ph.vaddr as usize, mega);
+        let seg_end = round_up(ph.vaddr as usize + ph.memsz as usize, mega);
+        let perms = segment_perms(&ph);
+
+        let mut v = seg_start;
+        while v < seg_end {
+            match megapage_vaddr[..megapage_count].iter().position(|&mv| mv == v) {
+                Some(idx) => megapage_perms[idx] |= perms,
+                None => {
+                    assert!(
+                        megapage_count < MAX_PROGRAM_MEGAPAGES,
+                        "loaded ELF needs more distinct megapages than this loader's fixed table"
+                    );
+                    megapage_vaddr[megapage_count] = v;
+                    megapage_perms[megapage_count] = perms;
+                    megapage_count += 1;
+                }
+            }
+            v += mega;
+        }
+    }
+
+    // Pass 2: retype and map exactly one `FrameMega` per unique megapage
+    // (not one per segment — see pass 1), with its unioned permissions.
+    let mut megapage_paddr = [0usize; MAX_PROGRAM_MEGAPAGES];
+    for slot in 0..megapage_count {
+        let frame_cptr = *next_slot;
+        *next_slot += 1;
+        let Capability::Frame { id: frame_id, .. } =
+            retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr)
+        else {
+            panic!("expected a Frame capability");
+        };
+        megapage_paddr[slot] = state.frames.get(frame_id.0 as usize).unwrap().paddr;
+        map(state, root, frame_cptr, vspace_cptr, megapage_vaddr[slot], megapage_perms[slot]);
+    }
+
+    // Pass 3: copy each segment's file bytes into whichever already-mapped
+    // megapage(s) it overlaps, at the right offset within each.
+    for i in 0..header.phnum {
+        let Some(ph) = elf::program_header(spec.elf_bytes, &header, i).expect("loaded ELF program header") else {
+            continue;
+        };
+        let seg_start = round_down(ph.vaddr as usize, mega);
+        let seg_end = round_up(ph.vaddr as usize + ph.memsz as usize, mega);
+        let file_start = ph.vaddr as usize;
+        let file_end = file_start + ph.filesz as usize;
+
+        let mut v = seg_start;
+        while v < seg_end {
+            let idx = megapage_vaddr[..megapage_count]
+                .iter()
+                .position(|&mv| mv == v)
+                .expect("every segment megapage was recorded in pass 1");
+            let paddr = megapage_paddr[idx];
 
             // Copy only the file bytes that actually land within this step's
             // byte range; anything outside `[file_start, file_end)` (BSS, or
             // simply a step this segment's `filesz` doesn't reach) is left as
             // the Frame's own zeroed-on-retype contents.
-            let frame_end = frame_vaddr + mega;
-            let copy_start = frame_vaddr.max(file_start);
-            let copy_end = frame_end.min(file_end);
+            let step_end = v + mega;
+            let copy_start = v.max(file_start);
+            let copy_end = step_end.min(file_end);
             if copy_start < copy_end {
-                let within_frame = copy_start - frame_vaddr;
+                let within_frame = copy_start - v;
                 let file_offset = ph.offset as usize + (copy_start - file_start);
-                // SAFETY: `paddr` is this thread's own freshly retyped,
-                // exclusively owned, zeroed Frame (per `Untyped::bump`'s "no
-                // reclaim" guarantee) — identity-mapped in *this* (the
-                // launcher's own) address space, since it came from the
-                // shared kernel megapage's identity-mapped range.
+                // SAFETY: `paddr` names a Frame retyped in pass 2 above,
+                // exclusively owned by this launcher and zeroed on retype
+                // (`Untyped::bump`'s "no reclaim" guarantee) — identity-mapped
+                // in *this* (the launcher's own) address space, since it came
+                // from the shared kernel megapage's identity-mapped range.
+                // Two segments sharing a megapage write disjoint byte ranges
+                // within it (their own `[file_start, file_end)`), never the
+                // same bytes twice.
                 unsafe {
                     let dst = (paddr + within_frame) as *mut u8;
                     let src = &spec.elf_bytes[file_offset..file_offset + (copy_end - copy_start)];
                     core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
                 }
             }
-
-            map(state, root, frame_cptr, vspace_cptr, frame_vaddr, perms);
-            frame_vaddr += mega;
+            v += mega;
         }
     }
 
@@ -342,13 +414,14 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
     configure_frame.set_mr(3, vspace_cptr);
     admin::configure(state, root, tcb_cptr, &mut configure_frame).expect("launcher configure must succeed");
 
-    tcb_id
+    LoadedProgram { tcb: tcb_id, vspace_cptr }
 }
 
 /// The actual "N programs, data-driven" entry point: loads every spec in
-/// `specs`, in order, via [`load`], returning each resulting [`TcbId`] in the
-/// same order. `N` is fixed at compile time (this crate has no allocator) —
-/// callers destructure the result with a matching-length array pattern, e.g.
+/// `specs`, in order, via [`load`], returning each resulting [`LoadedProgram`]
+/// in the same order. `N` is fixed at compile time (this crate has no
+/// allocator) — callers destructure the result with a matching-length array
+/// pattern, e.g.
 /// `let [server, client] = load_all(state, root, untyped_cptr, &specs, &mut next_slot);`.
 pub fn load_all<const N: usize>(
     state: &mut KernelState,
@@ -356,10 +429,41 @@ pub fn load_all<const N: usize>(
     untyped_cptr: CPtr,
     specs: &[ProgramSpec; N],
     next_slot: &mut CPtr,
-) -> [TcbId; N] {
-    let mut out = [TcbId(0); N];
+) -> [LoadedProgram; N] {
+    let mut out = [LoadedProgram { tcb: TcbId(0), vspace_cptr: 0 }; N];
     for (slot, spec) in out.iter_mut().zip(specs.iter()) {
         *slot = load(state, root, untyped_cptr, spec, next_slot);
     }
     out
+}
+
+/// ADR-0022 Part 2: retypes one 4 KiB `Frame` and maps it read/write into
+/// both `(vspace_a, vaddr_a)` and `(vspace_b, vaddr_b)` — the RFC-0019 shared
+/// `(runtime, service)` channel. Neither loaded program receives a capability
+/// to the Frame itself (see the module doc); each just gets a live mapping at
+/// its own chosen virtual address, exactly like its stack. Panics on failure,
+/// same trust tier as [`load`] — this runs before either program's first
+/// instruction, with root's full privilege.
+/// `#[allow(dead_code)]`: this module is compiled fresh into each binary
+/// that shares it via `#[path]` (see [`mint`]'s identical note) — only
+/// `frame_demo/loader.rs` calls this today.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn map_shared_frame(
+    state: &mut KernelState,
+    root: TcbId,
+    untyped_cptr: CPtr,
+    vspace_a: CPtr,
+    vaddr_a: usize,
+    vspace_b: CPtr,
+    vaddr_b: usize,
+    next_slot: &mut CPtr,
+) {
+    let frame_cptr = *next_slot;
+    *next_slot += 1;
+    let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameSmall, frame_cptr) else {
+        panic!("expected a Frame capability");
+    };
+    map(state, root, frame_cptr, vspace_a, vaddr_a, PERM_R | PERM_W | PERM_U);
+    map(state, root, frame_cptr, vspace_b, vaddr_b, PERM_R | PERM_W | PERM_U);
 }

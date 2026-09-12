@@ -244,18 +244,47 @@
   program scratch memory" beyond just a stack, since every future confined service wants
   one; not yet used by either demo (`heap_megapages: 0`), added because the launcher
   needed to support it before a service that actually allocates exists.
-  **Deliberately does NOT touch shared-`Frame` mapping** — `lantern-kernel`'s `Frame`
-  object is capped at exactly one mapping (`lantern-kernel/src/object.rs`'s
-  `Frame::mapped_at` doc: "Phase 1 has no shared-frame IPC yet, so a Frame has at most
-  one mapping, full stop"), so a `Frame` mapped RW into two VSpaces at once — what
-  [RFC-0019](../lantern-rfcs/rfcs/0019-confined-service-call-protocol.md)'s transport
-  needs — is a kernel object-model change, not a loader one; left for ADR-0022 Part 2.
+  At the time, deliberately left shared-`Frame` mapping out of scope, since
+  `lantern-kernel`'s `Frame` object was capped at exactly one mapping — see the next
+  entry, done the following round.
   Verified: clean `--target riscv64gc-unknown-none-elf` release build + `cargo clippy
   --all-targets -D warnings`, both binaries; 14 host tests (`cargo test --target
   x86_64-unknown-linux-gnu`, both binaries, unaffected — `elf.rs`/`fdt.rs` untouched);
   real QEMU re-run of both binaries — hello-service benchmark output unchanged (including
   at `-m 64M`), broker demo 3/3 reproducible `ok=true` runs — byte-for-byte identical to
   the pre-refactor output recorded above.
+- **`launch::map_shared_frame` + a third demo proving it under real QEMU** (2026-09-13,
+  [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md) Part 2 —
+  see its "Implementation note"). `lantern-kernel`'s `Frame` object now allows up to two
+  simultaneous mappings (`lantern-kernel/STATUS.md`); `map_shared_frame` retypes one 4 KiB
+  `Frame` and invokes `Map` on it twice — once per target VSpace — while root still holds
+  full boot-time privilege, before either program's first instruction runs. Neither loaded
+  program needs a capability to the Frame itself, only the already-mapped virtual address
+  (same as its stack). `load`/`load_all` now return a `LoadedProgram { tcb, vspace_cptr }`
+  instead of a bare `TcbId`, so a caller has the `vspace_cptr` to pass here.
+  **Also fixed a real, newly-surfaced bug in `load`'s segment loop**: two `PT_LOAD`
+  segments landing in the same megapage (common once a binary has real `.rodata`/`.data`
+  content, not just `.text` — this crate's first three demo ELFs never triggered it) tried
+  to map the same virtual address twice, and the second attempt failed
+  (`FrameInvoke::Map`'s "already mapped here" check, working exactly as designed). Fixed by
+  restructuring `load` into three passes: compute the *set* of unique megapages across all
+  segments with each one's unioned permission bits, retype+map exactly one `FrameMega` per
+  unique megapage, then copy every segment's file bytes into whichever megapage(s) it
+  overlaps. Caught by the new demo below — its ELFs are the first built by this crate
+  large enough to have a genuine separate `.rodata` segment.
+  **New third demo, `lantern-boot-frame-demo`** (`frame-service`/`frame-client`, own
+  isolated boot image — same separateness reasoning as the broker demo): the first real,
+  confined, QEMU-level proof that `lantern_abi::frame::Channel`
+  ([RFC-0019](../lantern-rfcs/rfcs/0019-confined-service-call-protocol.md)/[ADR-0024](../lantern-rfcs/adr/0024-confined-service-call-protocol.md))
+  moves bytes through an actual shared page, not just a host-side unit test. The client
+  `Channel::call`s an 11-byte request; the service `Channel::recv_request`/`reply`s a real
+  bitwise-NOT transform over it; the client independently recomputes the expected result
+  and signals one of two distinguishable notifications depending on whether it matched —
+  always an observable, differentiated outcome, never a silent hang on failure. 3/3
+  reproducible `client Signal'd SUCCESS` runs. Verified: clean riscv64 release build +
+  clippy on all three binaries (plus `frame-service`/`frame-client` standalone); 14 host
+  tests × 3 binaries; existing hello-service benchmark and broker demo QEMU runs
+  reconfirmed unaffected.
 
 ## Next
 - **Root-cause the IPC round-trip-loss bug above — now with a second, real manifestation
@@ -307,10 +336,8 @@
   and still hand-write their own `[ProgramSpec; 2]` in source — a real root-task/launch
   description that isn't compiled in (loading from a block device, or a data file
   `lantern-sdk`-style) is unstarted, and only matters once something other than a fixed
-  demo needs to pick its own launch set. The shared-`Frame` half of the launcher
-  (ADR-0022 Part 2 — mapping one `Frame` into two VSpaces for the RFC-0019 transport)
-  needs a `lantern-kernel` object-model change first (`Frame::mapped_at`'s one-mapping
-  cap) and is not part of this crate's own remaining work until that lands.
+  demo needs to pick its own launch set. ~~The shared-`Frame` half of the launcher (ADR-0022
+  Part 2)~~ — **done 2026-09-13**, `launch::map_shared_frame` (see "Done" above).
 - ~~Wire `lantern_capabilities::Broker`'s actual Rust API into a real confined program~~ —
   **done 2026-09-05.** `Broker` now has a `BrokerBackend` trait with an `Abi` (confined,
   `lantern-abi`-only) and a `KernelBackend` (`&mut KernelState`) impl;

@@ -116,10 +116,10 @@ pub unsafe fn run(mem_end: usize) -> ! {
         },
     ];
     let [server, client] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
-    state.make_ready(server);
+    state.make_ready(server.tcb);
 
     crate::println!("boot: entering client (loaded ELF, own VSpace, U-mode)");
     // SAFETY: first and only call on this hart; the client's context and address
     // space were both fully populated by `launch::load_all` above.
-    unsafe { lantern_kernel::enter_first_thread(client) }
+    unsafe { lantern_kernel::enter_first_thread(client.tcb) }
 }

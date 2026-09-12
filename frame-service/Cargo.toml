@@ -1,0 +1,20 @@
+[package]
+name = "lantern-frame-service"
+version = "0.0.0"
+edition = "2021"
+description = "A minimal standalone riscv64 ELF binary demonstrating the RFC-0019/ADR-0024 shared-Frame service side: lantern_abi::frame::Channel::recv_request/reply over a real shared page (ADR-0022 Part 2), performing a trivial per-byte transform. Loaded by lantern-boot's frame demo (src/frame_demo/). Built on lantern-abi and nothing else."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-frame-service"
+path = "src/main.rs"
+
+[dependencies]
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

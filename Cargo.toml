@@ -17,6 +17,13 @@ path = "src/main.rs"
 name = "lantern-boot-broker-demo"
 path = "src/broker_demo/main.rs"
 
+[[bin]]
+# RFC-0019/ADR-0024's shared-Frame framing demo (ADR-0022 Part 2) — a third,
+# isolated binary, same reasoning as the broker demo above; see
+# src/frame_demo/loader.rs's module doc.
+name = "lantern-boot-frame-demo"
+path = "src/frame_demo/main.rs"
+
 [dependencies]
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
 lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }
