@@ -32,6 +32,9 @@ mod pmm;
 #[path = "../uart.rs"]
 mod uart;
 #[cfg(target_arch = "riscv64")]
+#[path = "../launch.rs"]
+mod launch;
+#[cfg(target_arch = "riscv64")]
 mod loader;
 
 #[cfg(target_arch = "riscv64")]

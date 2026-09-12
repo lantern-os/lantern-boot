@@ -218,6 +218,44 @@
   while building this, and how the demo's own design routes around it. `cargo clippy -D
   warnings` clean on both binaries; existing `lantern-boot` binary's own build, clippy, host
   tests, and full QEMU benchmark run all reconfirmed unaffected.
+- **A unified, data-driven launcher — the RFC-0018/ADR-0022 Part 1 loader work
+  ([RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)),
+  2026-09-12.** New `src/launch.rs`, shared via `#[path]` into both binaries (same
+  convention as `elf.rs`/`fdt.rs`/`pmm.rs`/`uart.rs`): `ProgramSpec` (an ELF image,
+  `arg0`, a `grants: &[(CPtr, CPtr)]` list `CopyCross`'d into the new program's CSpace,
+  an optional self-CNode grant, and an optional heap size) is the launch description;
+  `load` builds one program from a spec; `load_all::<N>` loads a fixed-size array of
+  them and returns their `TcbId`s — the actual "N programs, data-driven" entry point,
+  generic over `N` rather than hardcoded to two (this crate has no allocator, so `N` is
+  compile-time, same discipline `lantern-kernel`'s own fixed pools use). `loader.rs`
+  (hello-service demo) and `broker_demo/loader.rs` (RFC-0010 demo) are now both thin
+  callers that do their own demo-specific root/Untyped/CNode bootstrap and endpoint/
+  resource minting, then build a 2-entry `[ProgramSpec; 2]` and call `launch::load_all`
+  — the actual "take an ELF, build it a VSpace/CNode/Tcb, wire in its capabilities" logic
+  that used to be hand-duplicated across both files lives in exactly one place now.
+  **Also lifts the one-Frame-per-segment `assert_eq!` both predecessor loaders carried**:
+  `load` now loops, retyping and mapping one `FrameMega` per 2 MiB step across a
+  segment's range and copying only the file bytes that land in each step, so a segment
+  spanning more than one megapage loads correctly instead of panicking (never hit in
+  practice — both demo ELFs are still small — but a real fragility removed, and required
+  either way once a confined service's binary or data segment grows past 2 MiB).
+  **Gained a per-program heap** (`ProgramSpec::heap_megapages`, mapped at a new
+  `HEAP_VADDR` above the stack) — ordinary private memory, generalizing "give a loaded
+  program scratch memory" beyond just a stack, since every future confined service wants
+  one; not yet used by either demo (`heap_megapages: 0`), added because the launcher
+  needed to support it before a service that actually allocates exists.
+  **Deliberately does NOT touch shared-`Frame` mapping** — `lantern-kernel`'s `Frame`
+  object is capped at exactly one mapping (`lantern-kernel/src/object.rs`'s
+  `Frame::mapped_at` doc: "Phase 1 has no shared-frame IPC yet, so a Frame has at most
+  one mapping, full stop"), so a `Frame` mapped RW into two VSpaces at once — what
+  [RFC-0019](../lantern-rfcs/rfcs/0019-confined-service-call-protocol.md)'s transport
+  needs — is a kernel object-model change, not a loader one; left for ADR-0022 Part 2.
+  Verified: clean `--target riscv64gc-unknown-none-elf` release build + `cargo clippy
+  --all-targets -D warnings`, both binaries; 14 host tests (`cargo test --target
+  x86_64-unknown-linux-gnu`, both binaries, unaffected — `elf.rs`/`fdt.rs` untouched);
+  real QEMU re-run of both binaries — hello-service benchmark output unchanged (including
+  at `-m 64M`), broker demo 3/3 reproducible `ok=true` runs — byte-for-byte identical to
+  the pre-refactor output recorded above.
 
 ## Next
 - **Root-cause the IPC round-trip-loss bug above — now with a second, real manifestation
@@ -261,14 +299,18 @@
 - Switch back to 4 KiB pages (`lantern-hal`'s `map`, already correct and host-tested) once
   the QEMU 3-level-walk limitation is resolved — `map_megapage`'s 2 MiB granularity is a
   documented environment workaround, not the intended long-term page size.
-- A real root-task crate, and/or loading from a real block device instead of
-  `include_bytes!`, once `lantern-boot` needs to load more than one fixed program
-  (RFC-0008's "Future possibilities") — `broker_demo/loader.rs`'s own generalised `load()`
-  is a step in that direction but is still a second, separate, `include_bytes!`-based
-  loader, not a unification of the two. [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
-  (Accepted) makes this Phase 3's foundational work: the narrowing-waterfall loader gains
-  the ability to load N programs and place exactly the capabilities named by a launch
-  description into each CSpace via `CNodeInvoke::CopyCross`.
+- ~~A real root-task crate, and/or loading from a real block device instead of
+  `include_bytes!`, once `lantern-boot` needs to load more than one fixed program; unify
+  `loader.rs`/`broker_demo/loader.rs` into one shared launch module~~ — **the unification
+  and the data-driven `N`-ary launch description are done, 2026-09-12** (`src/launch.rs`,
+  see "Done" above). Still open: both demos still embed their ELFs via `include_bytes!`
+  and still hand-write their own `[ProgramSpec; 2]` in source — a real root-task/launch
+  description that isn't compiled in (loading from a block device, or a data file
+  `lantern-sdk`-style) is unstarted, and only matters once something other than a fixed
+  demo needs to pick its own launch set. The shared-`Frame` half of the launcher
+  (ADR-0022 Part 2 — mapping one `Frame` into two VSpaces for the RFC-0019 transport)
+  needs a `lantern-kernel` object-model change first (`Frame::mapped_at`'s one-mapping
+  cap) and is not part of this crate's own remaining work until that lands.
 - ~~Wire `lantern_capabilities::Broker`'s actual Rust API into a real confined program~~ —
   **done 2026-09-05.** `Broker` now has a `BrokerBackend` trait with an `Abi` (confined,
   `lantern-abi`-only) and a `KernelBackend` (`&mut KernelState`) impl;

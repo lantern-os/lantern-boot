@@ -31,6 +31,8 @@ mod fdt;
 #[cfg(target_arch = "riscv64")]
 mod entry;
 #[cfg(target_arch = "riscv64")]
+mod launch;
+#[cfg(target_arch = "riscv64")]
 mod loader;
 #[cfg(target_arch = "riscv64")]
 mod pmm;
