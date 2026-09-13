@@ -313,6 +313,27 @@
   (`lantern-boot`, `broker-demo`, `frame-demo`, `keystore-demo`, `store-demo`)
   regression-checked together; clean riscv64 release build + clippy on both new
   standalone crates and the updated binary.
+- **A sixth demo, `lantern-boot-wasm-probe-demo`** (2026-09-13, same round) — this crate's
+  first **single-program** demo (the probe is entirely self-contained, no IPC to anyone),
+  and the first real proof that `lantern-runtime/riscv64-probe`'s Wasmtime `no_std` +
+  Pulley `riscv64` link proof ([RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)
+  Part 3 / [ADR-0023](../lantern-rfcs/adr/0023-wasmtime-no-std-pulley-hosting.md)) actually
+  **runs** under this crate's real loader and kernel, not just `cargo test`'s host-side
+  platform-shim exercise. That probe's own doc previously said it couldn't be loaded — true
+  at its original size, but for a much more precise reason than "the loader isn't ready
+  yet" (which shipped weeks ago): its 64 MiB `.bss` arena alone needed ~32 of
+  `lantern-kernel`'s `MAX_FRAMES` (a hard 16 system-wide,
+  [`lantern-kernel/src/limits.rs`](../lantern-kernel/src/limits.rs)) — categorically too
+  many, not just a lot of memory. Fixed on the `riscv64-probe` side (see
+  `lantern-runtime/STATUS.md`): the arena and the binary's own heap were both bisected
+  down to what the trivial embedded component actually needs (256 KiB / 2 MiB), bringing
+  the whole program to ~4 `FrameMega`s total — small enough this crate's existing
+  `ProgramSpec`/`launch::load_all` needed **zero changes** to load it, just a new
+  single-entry loader. **4/4 reproducible `probe Signal'd SUCCESS`** under real QEMU; all
+  five prior demos regression-checked unaffected. **Still not the RFC-0018 integration
+  demo** — no host imports, no `IpcKeystore`/`IpcFilesystem`, no real (non-trivial) guest
+  component; this demo's job was narrower and now done: prove the loader can actually
+  place and run a Wasmtime+Pulley binary under the real kernel at all.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS

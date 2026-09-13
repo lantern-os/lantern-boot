@@ -39,6 +39,14 @@ path = "src/keystore_demo/main.rs"
 name = "lantern-boot-store-demo"
 path = "src/store_demo/main.rs"
 
+[[bin]]
+# lantern-runtime/riscv64-probe's Wasmtime+Pulley riscv64 link proof, actually
+# loaded and run under the real kernel for the first time (RFC-0018 Part 3 /
+# ADR-0023) -- a sixth, isolated binary, this crate's first single-program
+# demo; see src/wasm_probe_demo/loader.rs's module doc.
+name = "lantern-boot-wasm-probe-demo"
+path = "src/wasm_probe_demo/main.rs"
+
 [dependencies]
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
 lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }
