@@ -1,0 +1,24 @@
+[package]
+name = "lantern-keystore-service"
+version = "0.0.0"
+edition = "2021"
+description = "A minimal standalone riscv64 ELF binary running a real, confined lantern_crypto::Keystore: a live Broker::mint+grant_via_reply access-grant round (ADR-0022 Part 1, the Broker-confinement pattern lantern-boot's broker-service already proved), then an RFC-0019/ADR-0024 SIGN/ENCRYPT/DECRYPT Recv loop over lantern_abi::frame::Channel and a real shared Frame (ADR-0022 Part 2). Loaded by lantern-boot's keystore demo (src/keystore_demo/). Built on lantern-abi, lantern-capabilities, and lantern-crypto with default-features off — nothing from the TCB."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-keystore-service"
+path = "src/main.rs"
+
+[dependencies]
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+# default-features = false -> the confined `Abi` broker backend only; no lantern-kernel,
+# nothing from the TCB.
+lantern-capabilities = { git = "https://github.com/lantern-os/lantern-capabilities", branch = "main", default-features = false }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

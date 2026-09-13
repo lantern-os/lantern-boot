@@ -285,18 +285,44 @@
   clippy on all three binaries (plus `frame-service`/`frame-client` standalone); 14 host
   tests × 3 binaries; existing hello-service benchmark and broker demo QEMU runs
   reconfirmed unaffected.
+- **A fourth demo, `lantern-boot-keystore-demo`** (2026-09-13,
+  [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md)/[ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)) —
+  a real, confined `lantern_crypto::Keystore`, the first non-`Broker` service ported this
+  way. New `keystore-service`/`keystore-client` standalone crates + `src/keystore_demo/`.
+  **Phase 1 proven under QEMU, 4/4 reproducible**: the client `Call`s (registering a
+  reply-leg destination, `broker-client`'s convention), `keystore-service` `Recv`s, then
+  runs a **live** `Keystore::request_key_access` + `deliver_grant_via_reply` (real
+  `Broker::mint`/`Reply` via the `Abi` backend, scoped to a real AEAD key it just generated)
+  — `Mint'd ... ok=true`, `Reply'd ... ok=true` every run. **Phase 2 (the client using its
+  granted badge to `Channel::call` SIGN/ENCRYPT/DECRYPT,
+  [RFC-0019](../lantern-rfcs/rfcs/0019-confined-service-call-protocol.md)) does not
+  complete — blocked on a `lantern-kernel` bug, not this crate's code.** Extensive
+  diagnosis (temporary trap-handler instrumentation, since reverted): the client's `Call`
+  immediately after being resumed via the service's capability-transferring `Reply` never
+  reaches the service — the transferred capability is verified present and correct
+  (right `EndpointId`, badge, `Rights::WRITE | Rights::GRANT`), the endpoint queue is
+  `Empty`, `has_ready()` is `true`, no `SyscallError` is raised — yet neither thread's
+  state nor `scheduler.current` changes across the trap, in a `dev`-profile (debug
+  assertions on) build with no panic either. Full record in `lantern-kernel/STATUS.md`'s
+  "Known Phase 1 gaps" (a new, 100%-reproducible manifestation of the existing
+  "IPC round-trip loss" entry, not a new bug class). Verified everything *else*: `wire`
+  dispatch is the same `lantern_crypto::wire::handle_request` already unit-tested
+  (`lantern-crypto/STATUS.md`, 44 tests); clean riscv64 release build + clippy on all four
+  binaries plus the two new standalone crates; existing hello/broker/frame demo QEMU runs
+  reconfirmed byte-for-byte unaffected (regression-checked after this round).
 
 ## Next
-- **Root-cause the IPC round-trip-loss bug above — now with a second, real manifestation
-  to compare against.** Candidates not yet tried: QEMU's GDB stub single-stepping across
-  the exact failing trap (entry assembly → Rust dispatch → exit assembly) to see directly
-  where the resumed context diverges from what `lantern-kernel` computed; testing against
-  a different QEMU version/`-cpu` flag the same way the Sv39-walk bug was differentially
-  tested; inspecting `RAW_FRAME`'s actual memory contents via the QEMU monitor at the
-  moment of the bad resume; comparing the two manifestations' actual trigger conditions
-  (this one's "parked mid-`Reply`, resumed via a *different* thread's `block_current`"
-  shape, vs. the original's "first `Call` right after a warm-up round trip") for anything
-  in common.
+- **Root-cause the IPC round-trip-loss bug above — now genuinely urgent, with a
+  100%-reproducible third manifestation (`lantern-boot-keystore-demo`) to work from
+  instead of a ~1-in-2000 flake.** See `lantern-kernel/STATUS.md`'s "Next" for the
+  prioritized candidate list this new evidence points at (isolating whether a nonzero
+  `MessageTag.label` on `Call` is the trigger; QEMU GDB-stub single-stepping across the
+  exact failing trap; comparing the trap trampoline's register save/restore specifically
+  for a nonzero label crossing a thread suspend/resume boundary — every prior nonzero-label
+  use, `CNodeInvoke`, has been a fast uninterrupted call, never one crossing a suspend).
+  Also still open: testing against a different QEMU version/`-cpu` flag the same way the
+  Sv39-walk bug was differentially tested; inspecting memory via the QEMU monitor at the
+  moment of the bad resume.
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.
 - Measured boot / kernel-image signature verification (RFC-0007/ADR-0011 primitives are

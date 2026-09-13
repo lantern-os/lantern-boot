@@ -24,6 +24,13 @@ path = "src/broker_demo/main.rs"
 name = "lantern-boot-frame-demo"
 path = "src/frame_demo/main.rs"
 
+[[bin]]
+# A real, confined lantern_crypto::Keystore, over RFC-0019/ADR-0024's wire
+# protocol — a fourth, isolated binary, same reasoning as the demos above;
+# see src/keystore_demo/loader.rs's module doc.
+name = "lantern-boot-keystore-demo"
+path = "src/keystore_demo/main.rs"
+
 [dependencies]
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
 lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }
