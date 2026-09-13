@@ -112,43 +112,25 @@
   `cycles` and `instret` tracking almost exactly 1:1 confirms this environment's QEMU/TCG
   `cycle` counter is an instruction-count proxy, not real-hardware cycle timing — see
   ADR-0013 for the full scope/methodology discussion and the Phase 1 target this sets.
-- **IPC round-trip loss — a real, reproducible, unresolved bug found while building the
-  above benchmark.** The *first* `Call` a thread issues immediately after being resumed via
-  `ipc::reply`'s direct `state.switch_to` occasionally never completes its switch to the
-  receiver: `lantern-kernel`'s own bookkeeping says it switched (`block_current` returns
-  `true`, `scheduler.current` genuinely becomes the receiver — confirmed with a hard
-  `assert!` in place of the normal `debug_assert!`, which never fired) and there is no
-  panic, no unexpected `scause` in QEMU's own `-d int` trace (every trap is a plain
-  `user_ecall`, no spurious interrupt), yet execution resumes the *original caller* anyway,
-  silently dropping that one message. Observed **exactly once per run so far, always
-  immediately after the untimed warm-up round trip** (i.e. the second time the client-side
-  `block_current`/direct-switch path runs), never again in the following ~2000 round trips.
-  Investigated and ruled out this session: `ipc::call`/`block_current`'s own logic (a
-  host-side unit test replaying the identical dispatch sequence against portable
-  `KernelState` — no real paging — passes cleanly, see
-  `lantern-kernel/src/syscall.rs`'s `two_call_reply_round_trips_in_a_row_client_runs_first`);
-  a spurious/timer interrupt (QEMU's own trace shows none); `sfence.vma`/TLB staleness on
-  VSpace reactivation (adding `fence.i` after `activate()`'s `sfence.vma` made no
-  difference); and stack overflow from the diagnostic instrumentation itself (the bug
-  reproduces identically with all narration/diagnostics silenced, including in the
-  *original*, pre-diagnostic minimal benchmark code). Not root-caused. Worked around for
-  now with `BENCH_SAFETY_MARGIN` (both `hello-service` and `boot_trap_handler` tolerate a
-  few extra round trips beyond the target; `Bench::done` ignores anything after the target
-  is reached) rather than blocking the benchmark on it — this is exactly the kind of
-  QEMU/hardware-level mystery the Sv39-walk bug above also was, and may turn out to be
-  related or may not.
-  **A second, distinct-looking manifestation found 2026-08-20** while building the
-  `broker_demo/` demo below: a thread parked mid-`Reply` (made ready via
-  `ipc::reply`'s own `state.make_ready(current)`, then only resumable later via a
-  *different* thread's own `block_current`/`Yield` — a path this project's existing
-  benchmark never actually exercises, since its server always re-enters `Recv` itself
-  immediately after being naturally rescheduled) never resumed at all, with no panic
-  and no further trap — confirmed via `[diag]` instrumentation showing the full
-  `Recv`→`Mint`→`Reply` sequence succeeding, then nothing further from that thread,
-  ever. Not investigated further (out of scope for that session's goal); the demo was
-  redesigned to route around it instead — see `broker_demo/main.rs`'s own trap-handler
-  doc for how and why. Recorded here because it's a new, real data point on the same
-  underlying class of bug, not because it's been root-caused.
+- ~~**IPC round-trip loss — a real, reproducible, unresolved bug found while building the
+  above benchmark.**~~ **ROOT-CAUSED AND FIXED, 2026-09-13** — see
+  `lantern-kernel/STATUS.md`'s "Known Phase 1 gaps" for the full writeup. In short:
+  `admin::configure` auto-`make_ready`s every `TCBConfigure`d thread, and
+  `enter_first_thread` never removed its own target from that ready queue before jumping
+  to it — so the very first program this crate's loader runs directly was always *also*
+  sitting in the ready queue. The first time it later blocked, it could pop that stale
+  entry (itself) right back off, restore the context it had just saved, and return having
+  switched to nothing — exactly the "occasionally drops a message with no error, no panic,
+  `scheduler.current` unchanged" symptom this bullet originally described, and exactly the
+  hazard `KernelState::switch_to`'s own doc comment already warned against. This also
+  explains the "second, distinct-looking manifestation" below (same root cause — a
+  never-cleared ready-queue entry, this time in a *different* schedule position, not a
+  different bug) and the 2026-09-13 100%-reproducible one `lantern-boot-keystore-demo`
+  found the same day (below). Fixed in `lantern-kernel` (`enter_first_thread` now clears
+  its target from the ready queue first); `BENCH_SAFETY_MARGIN`'s tolerance is no longer
+  needed for correctness but is left in place as harmless slack, not removed this round.
+  `hello-service`, `broker-demo`, `frame-demo`, and `keystore-demo` all QEMU-regression-
+  checked clean after the fix.
 - **`loader.rs`'s direct pool write is gone** — it now places each loaded program's shared
   endpoint capability via `lantern-kernel`'s new `CNodeInvoke::CopyCross`
   ([RFC-0010](../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md),
@@ -295,34 +277,21 @@
   `Broker::mint`/`Reply` via the `Abi` backend, scoped to a real AEAD key it just generated)
   — `Mint'd ... ok=true`, `Reply'd ... ok=true` every run. **Phase 2 (the client using its
   granted badge to `Channel::call` SIGN/ENCRYPT/DECRYPT,
-  [RFC-0019](../lantern-rfcs/rfcs/0019-confined-service-call-protocol.md)) does not
-  complete — blocked on a `lantern-kernel` bug, not this crate's code.** Extensive
-  diagnosis (temporary trap-handler instrumentation, since reverted): the client's `Call`
-  immediately after being resumed via the service's capability-transferring `Reply` never
-  reaches the service — the transferred capability is verified present and correct
-  (right `EndpointId`, badge, `Rights::WRITE | Rights::GRANT`), the endpoint queue is
-  `Empty`, `has_ready()` is `true`, no `SyscallError` is raised — yet neither thread's
-  state nor `scheduler.current` changes across the trap, in a `dev`-profile (debug
-  assertions on) build with no panic either. Full record in `lantern-kernel/STATUS.md`'s
-  "Known Phase 1 gaps" (a new, 100%-reproducible manifestation of the existing
-  "IPC round-trip loss" entry, not a new bug class). Verified everything *else*: `wire`
-  dispatch is the same `lantern_crypto::wire::handle_request` already unit-tested
+  [RFC-0019](../lantern-rfcs/rfcs/0019-confined-service-call-protocol.md)) initially did
+  not complete — a `lantern-kernel` bug, not this crate's code, ROOT-CAUSED AND FIXED the
+  same day (2026-09-13). See the "IPC round-trip loss" entry above and
+  `lantern-kernel/STATUS.md`'s "Known Phase 1 gaps" for the full writeup: this demo's
+  specific call shape (a client's first post-grant `Call`, right after a
+  capability-transferring `Reply`) landed on the bug's self-pop condition 100% of the
+  time, unlike `hello-service`'s ~1-in-2000. Fixed, and now 4/4 reproducible
+  `client Signal'd SUCCESS`** — both ENCRYPT and DECRYPT round-trip correctly through the
+  confined `keystore-service` over the real shared `Frame`. Verified: `wire` dispatch is
+  the same `lantern_crypto::wire::handle_request` already unit-tested
   (`lantern-crypto/STATUS.md`, 44 tests); clean riscv64 release build + clippy on all four
   binaries plus the two new standalone crates; existing hello/broker/frame demo QEMU runs
-  reconfirmed byte-for-byte unaffected (regression-checked after this round).
+  reconfirmed unaffected by the kernel fix.
 
 ## Next
-- **Root-cause the IPC round-trip-loss bug above — now genuinely urgent, with a
-  100%-reproducible third manifestation (`lantern-boot-keystore-demo`) to work from
-  instead of a ~1-in-2000 flake.** See `lantern-kernel/STATUS.md`'s "Next" for the
-  prioritized candidate list this new evidence points at (isolating whether a nonzero
-  `MessageTag.label` on `Call` is the trigger; QEMU GDB-stub single-stepping across the
-  exact failing trap; comparing the trap trampoline's register save/restore specifically
-  for a nonzero label crossing a thread suspend/resume boundary — every prior nonzero-label
-  use, `CNodeInvoke`, has been a fast uninterrupted call, never one crossing a suspend).
-  Also still open: testing against a different QEMU version/`-cpu` flag the same way the
-  Sv39-walk bug was differentially tested; inspecting memory via the QEMU monitor at the
-  moment of the bad resume.
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.
 - Measured boot / kernel-image signature verification (RFC-0007/ADR-0011 primitives are
