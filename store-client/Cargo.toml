@@ -1,0 +1,21 @@
+[package]
+name = "lantern-store-client"
+version = "0.0.0"
+edition = "2021"
+description = "A minimal standalone riscv64 ELF binary demonstrating a real client of a confined lantern_filesystem::Store over RFC-0019/ADR-0024's wire protocol: asks the store-service for file access, then WRITEs and READs a message through it over a real shared Frame, independently verifying the round trip before signalling one of two granted notifications. Loaded by lantern-boot's store demo (src/store_demo/). Built on lantern-abi/lantern-filesystem and nothing else."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-store-client"
+path = "src/main.rs"
+
+[dependencies]
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-filesystem = { git = "https://github.com/lantern-os/lantern-filesystem", branch = "main", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -31,6 +31,14 @@ path = "src/frame_demo/main.rs"
 name = "lantern-boot-keystore-demo"
 path = "src/keystore_demo/main.rs"
 
+[[bin]]
+# A real, confined lantern_filesystem::Store reaching its AEAD key through a
+# second confined service (a real keystore-service) -- a fifth, isolated
+# binary, three confined programs at once; see src/store_demo/loader.rs's
+# module doc.
+name = "lantern-boot-store-demo"
+path = "src/store_demo/main.rs"
+
 [dependencies]
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
 lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }

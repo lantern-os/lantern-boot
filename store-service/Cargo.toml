@@ -1,0 +1,23 @@
+[package]
+name = "lantern-store-service"
+version = "0.0.0"
+edition = "2021"
+description = "A minimal standalone riscv64 ELF binary running a real, confined lantern_filesystem::Store: registers itself as a keystore-service client to reach the store-wide AEAD key over a ChannelCipher (RFC-0019/ADR-0024), then a live Broker::mint+grant_via_reply file-access grant round for its own client, then an RFC-0019 READ/WRITE Recv loop over a second, independent shared Frame. Loaded by lantern-boot's store demo (src/store_demo/). Built on lantern-abi, lantern-capabilities, lantern-crypto, and lantern-filesystem with default-features off -- nothing from the TCB."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-store-service"
+path = "src/main.rs"
+
+[dependencies]
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-capabilities = { git = "https://github.com/lantern-os/lantern-capabilities", branch = "main", default-features = false }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+lantern-filesystem = { git = "https://github.com/lantern-os/lantern-filesystem", branch = "main", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

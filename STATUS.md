@@ -290,6 +290,29 @@
   (`lantern-crypto/STATUS.md`, 44 tests); clean riscv64 release build + clippy on all four
   binaries plus the two new standalone crates; existing hello/broker/frame demo QEMU runs
   reconfirmed unaffected by the kernel fix.
+- **A fifth demo, `lantern-boot-store-demo`** (2026-09-13, same round) — a real, confined
+  [`lantern_filesystem::Store`](../lantern-filesystem), and this crate's first demo with
+  **three** confined programs and **two** independent shared `Frame`s at once:
+  `keystore-service` (reused verbatim, unchanged — it never cared whether its "client" is
+  a human-facing demo or another confined service), new `store-service`/`store-client`
+  standalone crates. `store-service` registers as `keystore-service`'s own client
+  (`keystore-client`'s exact dance, replayed one layer down) to obtain a
+  [`lantern_filesystem::cipher::ChannelCipher`](../lantern-filesystem) reaching the AEAD
+  key over real IPC, *then* runs a live `Broker::mint`+`grant_via_reply` file-access grant
+  round for `store-client`, then serves RFC-0019 READ/WRITE
+  (`lantern_filesystem::wire::handle_request`) over a *second*, independent `Frame` —
+  `store-service` maps both shared `Frame`s into its own single VSpace at two different
+  virtual addresses. Proves the real "middle service" shape ADR-0022 describes: `Store`'s
+  own AEAD calls become a fresh nested `Channel::call` to `keystore-service` *while*
+  `store-service` is itself still mid-`Recv`-loop-serving its own client — the kernel
+  needed no special handling for this (`reply_to` is a plain per-TCB link, undisturbed by
+  any other syscalls a thread issues before eventually calling `Reply`). **4/4
+  reproducible `client Signal'd SUCCESS`, first try** — the same-round IPC
+  round-trip-loss fix generalizes cleanly to this more complex, nested-IPC topology, not
+  just the 2-program shape it was found and fixed in. All five `lantern-boot` demos
+  (`lantern-boot`, `broker-demo`, `frame-demo`, `keystore-demo`, `store-demo`)
+  regression-checked together; clean riscv64 release build + clippy on both new
+  standalone crates and the updated binary.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
