@@ -45,6 +45,28 @@
 //! ordinary, non-shared private Frame range, same as the stack) — generalizing
 //! "give a loaded program its own scratch memory" beyond just a stack, which
 //! every future confined service wants regardless of the shared `Frame`.
+//!
+//! **[`ArenaGrant`] is RFC-0018 Part 3's "retype `Untyped` → `Frame`,
+//! `FrameInvoke::Map`/`Unmap` into the runtime's VSpace at a reserved virtual
+//! range" (`rfcs/0018-confined-execution-port.md`'s Part 3 table).** Unlike
+//! the stack/heap above, these `FrameMega`s are granted **unmapped** — the
+//! program maps/unmaps them itself, on demand, as its own custom-platform
+//! `wasmtime_mmap_new`/`wasmtime_munmap` are called
+//! (`lantern-runtime/riscv64-probe/src/platform.rs`). That needs two things
+//! no earlier grant did: a capability to the program's *own* VSpace (so it
+//! can name itself as `FrameInvoke::Map`'s target — the same
+//! `self_cnode_dest` "chicken-and-egg... CopyCross" reasoning, sourced from
+//! `vspace_cptr` instead of `cnode_cptr`), and the unmapped Frame
+//! capabilities themselves. Deliberately **not** an Untyped grant: this
+//! kernel has no bounded/sub-Untyped retype (`admin::untyped_retype` rejects
+//! `ObjectType::Untyped` as a target), so an Untyped grant would hand the
+//! program the *same* unbounded retype authority the launcher itself holds —
+//! a real trust-boundary regression the "can an agent use this capability
+//! without being unnecessarily trusted?" question (`CLAUDE.md`) rules out. A
+//! fixed, launcher-sized pool of pre-retyped Frame capabilities keeps the
+//! program's authority bounded exactly the way every other grant in this
+//! module already is, while still exercising the real `FrameInvoke::Map`/
+//! `Unmap` syscalls from inside the confined program itself, on demand.
 
 use lantern_hal::TrapFrame;
 use lantern_kernel::admin;
@@ -66,6 +88,20 @@ pub const STACK_VADDR: usize = 0x8600_0000;
 /// gets mapped — one megapage above the stack, so the two never collide
 /// regardless of how large either grows within its own reserved range.
 pub const HEAP_VADDR: usize = STACK_VADDR + lantern_hal::RISCV64_MEGAPAGE_SIZE;
+
+/// Where a loaded program's optional arena `Frame` pool (see [`ArenaGrant`])
+/// gets *reserved* — the program itself chooses when/whether to map each
+/// megapage within this range. Fixed well clear of [`HEAP_VADDR`]'s own
+/// growth (16 megapages above it) rather than computed from any one spec's
+/// `heap_megapages`, so a spec's heap size can change without silently
+/// moving this. `#[allow(dead_code)]`: this module is compiled fresh into
+/// each binary that shares it via `#[path]` (same convention as [`mint`]'s
+/// identical note) — the *value* is what every `arena`-granted program's own
+/// platform code must duplicate (`riscv64-probe/src/platform.rs`'s own
+/// `ARENA_VADDR`), never read by `launch.rs` itself, so only serves as the
+/// one documented source of truth.
+#[allow(dead_code)]
+pub const ARENA_VADDR: usize = HEAP_VADDR + 16 * lantern_hal::RISCV64_MEGAPAGE_SIZE;
 
 pub const PERM_R: usize = 1 << 0;
 pub const PERM_W: usize = 1 << 1;
@@ -100,6 +136,24 @@ pub struct ProgramSpec<'a> {
     /// memory, not shared with anything (see the module doc's "still out of
     /// scope" note for why this isn't the RFC-0019 shared `Frame`).
     pub heap_megapages: usize,
+    /// If `Some`, this program additionally gets a bounded pool of *unmapped*
+    /// `FrameMega` capabilities plus a capability to its own VSpace, so it
+    /// can `FrameInvoke::Map`/`Unmap` them itself — see [`ArenaGrant`] and
+    /// the module doc.
+    pub arena: Option<ArenaGrant>,
+}
+
+/// See the module doc's `ArenaGrant` paragraph.
+pub struct ArenaGrant {
+    /// How many (initially unmapped) `FrameMega`s to retype and grant, at
+    /// consecutive `frame_dest_base..` slots in the program's own CSpace.
+    pub megapages: usize,
+    /// The program's own CSpace slot to grant a capability to *its own*
+    /// VSpace at.
+    pub self_vspace_dest: CPtr,
+    /// The first of `megapages` consecutive destination slots for the
+    /// granted (unmapped) Frame capabilities.
+    pub frame_dest_base: CPtr,
 }
 
 /// Root's own CNode capability slot, in its own CSpace — every caller of this
@@ -179,12 +233,15 @@ const UART_MEGAPAGE_BASE: usize = 0x1000_0000;
 /// these aren't retyped `Frame` objects, and `lantern-kernel` itself has no
 /// business knowing `lantern-boot`'s own kernel-image layout. See
 /// `loader.rs`'s original doc (unchanged reasoning, just relocated here).
-pub fn map_kernel_shared(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, vspace_id: VSpaceId) {
-    let Capability::Untyped { id: untyped_id, .. } =
-        state.lookup_cap(root, untyped_cptr).expect("launcher's own Untyped cap must resolve")
-    else {
-        panic!("expected an Untyped capability");
-    };
+///
+/// Its own branch-table spares now come from `lantern-kernel`'s
+/// `KernelPageTables` (`state.kernel_page_tables`), not a caller-supplied
+/// Untyped — see that type's doc for why: it's the fix for a real bug found
+/// while adding [`ArenaGrant`]'s self-mapping (a confined program's own
+/// `FrameInvoke::Map`, after its own paging is active, couldn't dereference a
+/// `VSpace` root bump-allocated from general memory). `lantern-boot/STATUS.md`
+/// has the full writeup.
+pub fn map_kernel_shared(state: &mut KernelState, vspace_id: VSpaceId) {
     let vspace_root = state.vspaces.get(vspace_id.0 as usize).unwrap().root as *mut lantern_hal::Riscv64PageTable;
 
     let kernel_flags = lantern_hal::Riscv64PteFlags::READ
@@ -199,11 +256,9 @@ pub fn map_kernel_shared(state: &mut KernelState, root: TcbId, untyped_cptr: CPt
         // table, same reasoning as `lantern_kernel::frame::map`'s identical
         // pattern (its own doc comment has the full explanation).
         let spare = state
-            .untypeds
-            .get_mut(untyped_id.0 as usize)
-            .unwrap()
-            .bump(lantern_hal::RISCV64_PAGE_SIZE, lantern_hal::RISCV64_PAGE_SIZE)
-            .expect("launcher's own Untyped must have room for kernel-shared L1 tables");
+            .kernel_page_tables
+            .alloc()
+            .expect("the kernel's own page-table arena must have room for kernel-shared L1 tables");
         let mut alloc = move || spare;
         // SAFETY: `vspace_root` is this VSpace's own freshly built, exclusively
         // owned root table; `vaddr`/`paddr` are megapage-aligned machine
@@ -238,7 +293,7 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
     else {
         panic!("expected a VSpace capability");
     };
-    map_kernel_shared(state, root, untyped_cptr, vspace_id);
+    map_kernel_shared(state, vspace_id);
 
     let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
 
@@ -390,6 +445,24 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
         // naming the *new* program's own CNode. Copying that into the new
         // program's own `dest_slot` gives it a real capability to itself.
         copy_cross(state, root, SELF_CNODE_CPTR, cnode_cptr, cnode_cptr, dest_slot);
+    }
+    if let Some(arena) = &spec.arena {
+        // The program's own VSpace, so it can invoke `FrameInvoke::Map`/
+        // `Unmap` naming itself — same "source doesn't exist until partway
+        // through `load`... CopyCross" reasoning as `self_cnode_dest` just
+        // above, just sourced from `vspace_cptr` instead of `cnode_cptr`.
+        copy_cross(state, root, SELF_CNODE_CPTR, vspace_cptr, cnode_cptr, arena.self_vspace_dest);
+        for i in 0..arena.megapages {
+            let frame_cptr = *next_slot;
+            *next_slot += 1;
+            let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr) else {
+                panic!("expected a Frame capability");
+            };
+            // Deliberately no `map` call here — granted unmapped; the
+            // program itself decides when/where within `ARENA_VADDR` to map
+            // each one (see the module doc).
+            copy_cross(state, root, SELF_CNODE_CPTR, frame_cptr, cnode_cptr, arena.frame_dest_base + i);
+        }
     }
 
     let sched_cptr = *next_slot;

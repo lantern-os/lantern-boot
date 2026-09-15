@@ -105,6 +105,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             grants: &[(endpoint_root_cptr, ENDPOINT_CPTR)],
             self_cnode_dest: Some(KEYSTORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
+            arena: None,
         },
         ProgramSpec {
             elf_bytes: KEYSTORE_CLIENT_ELF,
@@ -116,6 +117,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             ],
             self_cnode_dest: None,
             heap_megapages: 0,
+            arena: None,
         },
     ];
     let [service, client] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);

@@ -334,6 +334,45 @@
   demo** — no host imports, no `IpcKeystore`/`IpcFilesystem`, no real (non-trivial) guest
   component; this demo's job was narrower and now done: prove the loader can actually
   place and run a Wasmtime+Pulley binary under the real kernel at all.
+- **`ArenaGrant` — the launcher can grant a confined program a bounded pool of unmapped
+  `FrameMega`s + its own VSpace capability, for it to `FrameInvoke::Map`/`Unmap` itself
+  (2026-09-15, RFC-0018 Part 3)** — `launch.rs`'s `ProgramSpec::arena`/`ArenaGrant`: unlike
+  every other grant in this module, these `Frame`s are retyped but deliberately left
+  **unmapped**, and a capability to the program's own VSpace is copied in (same
+  "chicken-and-egg... CopyCross" shape `self_cnode_dest` already uses, sourced from
+  `vspace_cptr` instead). Deliberately *not* an Untyped grant — this kernel has no bounded/
+  sub-Untyped retype, so that would hand the program the launcher's own unbounded retype
+  authority; a fixed, launcher-sized Frame pool keeps authority bounded like every other
+  grant here. `lantern-runtime/riscv64-probe`'s `platform.rs` is the first consumer (see
+  `lantern-runtime/STATUS.md`).
+  **Wiring this up for real found a genuine, previously-unexercised kernel-visibility bug,
+  root-caused and fixed the same day.** Every earlier `FrameInvoke::Map`/`Unmap` in this
+  crate's demos was the launcher calling `lantern_kernel::frame::invoke` as a plain Rust
+  function pre-`enter_first_thread`, while `satp` is Bare (no translation) — any physical
+  address is directly addressable then. `ArenaGrant`'s self-mapping is the first real
+  `ecall` into `FrameInvoke` *after* a program's own paging is active, and RISC-V traps
+  don't switch page tables, so the kernel keeps running under that same active table —
+  which had no mapping for the `VSpace` root table's own physical memory (bump-allocated
+  from the general-memory `Untyped`, physical addresses loaded programs' own virtual layout
+  also numerically overlaps, e.g. `riscv64-probe`'s own linked `BASE_ADDRESS =
+  0x8400_0000`). Confirmed live under QEMU via the monitor (`info registers`, twice, 2s
+  apart — identical PC/`scause=13`(load page fault)/`stval` sitting exactly at the VSpace
+  root's own physical page). A first fix attempt (identity-mapping the whole general-memory
+  range S-mode-only in `map_kernel_shared`) collided with that same address reuse — the ELF
+  loader's own pass-2 then fails to map `riscv64-probe`'s `.text` at `0x8400_0000` because
+  the identity map already occupies that virtual address — reverted rather than shipped
+  broken. **The real fix landed in `lantern-kernel`**: a new
+  `object::KernelPageTables` — `VSpace` roots and `FrameInvoke::Map`'s on-demand L1/L0
+  branch pages now come from a small, fixed-size arena embedded directly in `KernelState`
+  (kernel `.bss`), not the general-memory `Untyped` range — so they're always inside the
+  one megapage `map_kernel_shared` already maps S-mode-only into every loaded VSpace,
+  regardless of which program's own table is active. `map_kernel_shared` itself
+  (`launch.rs`) dropped its own `untyped_cptr`/`root` parameters, sourcing its own
+  branch-page spares from the same arena. Zero `lantern-hal` changes, zero relinking of any
+  service crate — see `lantern-kernel/STATUS.md` for the kernel-side writeup.
+  **`wasm-probe-demo`'s `ArenaGrant` now genuinely self-maps its Wasm-linear-memory arena
+  via real `FrameInvoke::Map`/`Unmap`, 4/4 reproducible `probe Signal'd SUCCESS`** — all six
+  demos regression-checked clean on the same run.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS

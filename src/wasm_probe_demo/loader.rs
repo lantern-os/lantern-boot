@@ -17,19 +17,30 @@
 //! program down to ~4 `FrameMega`s total (image + stack + heap), closing the
 //! "loader integration" gap Part 3's own STATUS.md named as outstanding.
 //!
-//! **What this demo does not yet prove**: a real (non-trivial) guest
-//! component, host imports (`IpcKeystore`/`IpcFilesystem`), or a `Frame`-backed
-//! platform layer (the arena is still a `static`, not real `Untyped`→`Frame`
-//! retyping) — see `lantern-runtime/STATUS.md`'s "Next" for what's still
-//! outstanding on the way to the full RFC-0018 integration demo (keystore +
-//! store + a confined runtime together). This demo's job is narrower and
-//! concrete: prove the loader can actually place and run a Wasmtime+Pulley
-//! binary under the real kernel at all.
+//! **This probe now gets an [`ArenaGrant`]** — a bounded pool of unmapped
+//! `FrameMega` capabilities plus a capability to its own VSpace, which it
+//! maps/unmaps itself via real `FrameInvoke::Map`/`Unmap`
+//! (`riscv64-probe/src/platform.rs`), replacing the old `.bss` static array.
+//! Wiring this up for real found a genuine, previously-unexercised
+//! `lantern-kernel` bug — a confined program's own `FrameInvoke::Map`, the
+//! first real `ecall` into `FrameInvoke` after `enter_first_thread`, hung
+//! dereferencing its own VSpace's root table — fixed by
+//! `lantern_kernel::object::KernelPageTables` (see that type's doc, and this
+//! crate's own `STATUS.md`, for the full record). **4/4 reproducible `probe
+//! Signal'd SUCCESS`** with the real Frame-backed arena live end-to-end.
+//! **What this demo still does not prove**: a real (non-trivial) guest
+//! component, or host imports (`IpcKeystore`/`IpcFilesystem`) — see
+//! `lantern-runtime/STATUS.md`'s "Next" for what's outstanding on the way to
+//! the full RFC-0018 integration demo (keystore + store + a confined runtime
+//! together). This demo's job stays narrower and concrete: prove the loader
+//! can actually place and run a Wasmtime+Pulley binary under the real
+//! kernel at all, with its Wasm-linear-memory backing store made of real,
+//! self-mapped capabilities.
 
 use lantern_kernel::cap::{Capability, CNode, CNodeId, CPtr, ObjectType, Rights, TcbId, UntypedId};
 use lantern_kernel::object::{Tcb, Untyped};
 
-use crate::launch::{self, ProgramSpec, SELF_CNODE_CPTR};
+use crate::launch::{self, ArenaGrant, ProgramSpec, SELF_CNODE_CPTR};
 use crate::pmm;
 
 const WASM_PROBE_ELF: &[u8] = include_bytes!("../../assets/wasm-probe.elf");
@@ -40,11 +51,24 @@ const WASM_PROBE_ELF: &[u8] = include_bytes!("../../assets/wasm-probe.elf");
 pub const PROBE_SUCCESS_CPTR: CPtr = 4;
 pub const PROBE_FAILURE_CPTR: CPtr = 5;
 
+/// Matches `riscv64-probe/src/platform.rs`'s own `SELF_VSPACE_CPTR` — the
+/// same "duplicated shared constant" convention `../main.rs`'s
+/// `HEAP_BASE`/`HEAP_LEN` already established.
+const PROBE_SELF_VSPACE_CPTR: CPtr = 6;
+/// Matches `platform.rs`'s own `ARENA_FRAME_CPTR_BASE`.
+const PROBE_ARENA_FRAME_CPTR_BASE: CPtr = 7;
+/// Matches `platform.rs`'s own `REGIONS` — two unmapped `FrameMega`s (4 MiB),
+/// comfortable headroom over the 256 KiB the old static arena used, well
+/// within `lantern-kernel`'s `MAX_FRAMES = 16` budget alongside this demo's
+/// existing ~4 (image + stack + heap).
+const PROBE_ARENA_MEGAPAGES: usize = 2;
+
 const ARG0_PROBE: usize = 0;
 
 /// Sets up the loader's own privileged root identity, retypes the probe's two
 /// proof notifications, loads the one confined program (with a 2 MiB private
-/// heap — `ProgramSpec::heap_megapages`), and cold-starts it. Never returns.
+/// heap — `ProgramSpec::heap_megapages` — and a `Frame`-backed arena pool —
+/// `ProgramSpec::arena`), and cold-starts it. Never returns.
 ///
 /// `mem_end` is the end of usable RAM (`src/fdt.rs`'s device-tree read, or
 /// `pmm::GENERAL_MEMORY_END` on failure) — see `../loader.rs`'s `run`.
@@ -87,6 +111,11 @@ pub unsafe fn run(mem_end: usize) -> ! {
         // One FrameMega (2 MiB) at `launch::HEAP_VADDR` — must match
         // `lantern-runtime-riscv64-probe`'s own `HEAP_BASE`/`HEAP_LEN`.
         heap_megapages: 1,
+        arena: Some(ArenaGrant {
+            megapages: PROBE_ARENA_MEGAPAGES,
+            self_vspace_dest: PROBE_SELF_VSPACE_CPTR,
+            frame_dest_base: PROBE_ARENA_FRAME_CPTR_BASE,
+        }),
     }];
     let [probe] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
 
