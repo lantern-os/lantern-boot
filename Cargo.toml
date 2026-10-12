@@ -47,6 +47,14 @@ path = "src/store_demo/main.rs"
 name = "lantern-boot-wasm-probe-demo"
 path = "src/wasm_probe_demo/main.rs"
 
+[[bin]]
+# RFC-0018's integration proof: a confined lantern-runtime process hosting a
+# real Wasm guest component whose keystore grant is served over a shared Frame
+# by a separately confined keystore-service -- a seventh, isolated binary; see
+# src/runtime_demo/loader.rs's module doc.
+name = "lantern-boot-runtime-demo"
+path = "src/runtime_demo/main.rs"
+
 [dependencies]
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
 lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }

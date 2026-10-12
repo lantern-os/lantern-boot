@@ -30,6 +30,12 @@
 //!    attenuates from `ENDPOINT_CPTR` itself, not a separate stand-in
 //!    resource — this program's own retained authority *is* the thing being
 //!    scoped and handed out, the realistic shape ADR-0022 describes).
+//!
+//! **`arg0` picks which one key this instance holds and grants** — the one
+//! piece of launch-time configuration it takes: [`PROFILE_AEAD`] (an AEAD key,
+//! ENCRYPT|DECRYPT; `keystore_demo`/`store_demo`) or [`PROFILE_SIGNING`] (an
+//! Ed25519 key, SIGN only; `runtime_demo`, where the client is a confined
+//! `lantern-runtime` hosting a guest component that only ever signs).
 
 #![no_std]
 #![no_main]
@@ -62,21 +68,33 @@ const FRAME_VADDR: usize = 0x9000_0000;
 /// bytes for exactly this reason (this crate's own top-level doc).
 const DEMO_AEAD_SEED: [u8; 32] = [0x42; 32];
 
+/// Demo-only fixed Ed25519 seed, same caveat as [`DEMO_AEAD_SEED`].
+const DEMO_SIGNING_SEED: [u8; 32] = [0x24; 32];
+
+/// `arg0` values — see the module doc. Must match each loader's own constant.
+const PROFILE_AEAD: usize = 0;
+const PROFILE_SIGNING: usize = 1;
+
 /// Large enough for this demo's small ENCRYPT/DECRYPT payloads; a real
 /// service sizes this per its own worst-case reassembled argument
 /// (RFC-0019's "a fixed maximum reassembled argument size per op").
 const REQUEST_CAP: usize = 256;
 
-fn run(_arg0: usize) -> ! {
+fn run(arg0: usize) -> ! {
     let mut keystore = Keystore::new(SELF_CNODE_CPTR);
-    let key = keystore.generate_aead_key(DEMO_AEAD_SEED).unwrap();
+    let (key, ops) = match arg0 {
+        PROFILE_SIGNING => (keystore.generate_signing_key(DEMO_SIGNING_SEED), KeyOps::SIGN),
+        PROFILE_AEAD => (keystore.generate_aead_key(DEMO_AEAD_SEED), KeyOps::ENCRYPT.union(KeyOps::DECRYPT)),
+        _ => panic!("keystore-service: unknown arg0 profile"),
+    };
+    let key = key.unwrap();
     let mut backend = Abi;
 
     // Phase 1: one client Call's, registering its own reply-leg destination;
-    // grant it ENCRYPT|DECRYPT on the one demo key.
+    // grant it `ops` on the one demo key.
     let _ = sys::recv(ENDPOINT_CPTR);
     if let Ok(()) = keystore
-        .request_key_access(&mut backend, key, KeyOps::ENCRYPT.union(KeyOps::DECRYPT), ENDPOINT_CPTR, SCRATCH_CPTR)
+        .request_key_access(&mut backend, key, ops, ENDPOINT_CPTR, SCRATCH_CPTR)
         .and_then(|_badge| keystore.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)))
     {
         // Phase 2: serve RFC-0019 wire requests on the same endpoint — the

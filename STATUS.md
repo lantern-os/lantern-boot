@@ -374,6 +374,24 @@
   via real `FrameInvoke::Map`/`Unmap`, 4/4 reproducible `probe Signal'd SUCCESS`** — all six
   demos regression-checked clean on the same run.
 
+- **A seventh demo, `lantern-boot-runtime-demo` — RFC-0018's integration proof**
+  (2026-10-12). Two confined programs: `keystore-service` (new `arg0` profile: an Ed25519
+  key, granted SIGN-only) and `lantern-runtime/confined-runtime` (a confined
+  `lantern-runtime` process hosting a real Wasm guest component whose `keystore` grant is
+  `IpcKeystore` over the shared `Frame`). The runtime gets a 2 MiB heap and an `ArenaGrant`
+  of four unmapped `FrameMega`s it maps itself for the deserialized `.cwasm` and guest
+  linear memory. 12 of the kernel's 16 `MAX_FRAMES`. **6/6 reproducible `SUCCESS`**
+  (`-m 64M`, `128M`×4, `512M`); all six earlier demos regression-clean against fully
+  rebuilt program assets. `confined-runtime`'s release profile sets `strip = true`:
+  unstripped, the 2.3 MB ELF pushed this image past `linker.ld`'s single reserved
+  megapage (a link-time error, not a silent overlap). **Found a real `lantern-hal` bug**:
+  `initial_trap_frame` set `arg0` only in the raw `a0` slot, so every program started by
+  a normal context switch (rather than `enter_first_thread`) saw `arg0 == 0`. No earlier
+  demo passed a nonzero `arg0` to a second-started program, so nothing showed it. The
+  first symptom here was the keystore-service silently running its AEAD profile, caught
+  only because the runtime checks that ENCRYPT is *refused*. Fixed in `lantern-hal` (see
+  its STATUS.md); `keystore-service`'s `arg0` doc spells out the profiles.
+
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.
