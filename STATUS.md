@@ -392,6 +392,24 @@
   only because the runtime checks that ENCRYPT is *refused*. Fixed in `lantern-hal` (see
   its STATUS.md); `keystore-service`'s `arg0` doc spells out the profiles.
 
+- **An eighth demo, `lantern-boot-runtime-fs-demo` — RFC-0018's filesystem integration
+  proof** (2026-10-12, same day). `store_demo`'s three-program topology (keystore-service
+  in its AEAD profile ← store-service ← client) with the client replaced by
+  `lantern-runtime/confined-runtime`'s `lantern-confined-runtime-fs`, a confined runtime
+  hosting `confined-fs-guest` over `IpcFilesystem`. **6/6 reproducible `SUCCESS`**; all
+  seven earlier demos regression-clean. Sits at two kernel limits, documented in its
+  loader: `MAX_FRAMES` exactly 16/16, and root `CNODE_SLOTS` 31/32 — the latter only
+  because **`launch::load` now reuses one root scratch slot for an `ArenaGrant`'s whole
+  pool and `Delete`s root's copy of each arena Frame after granting it** (new
+  `launch::delete`). Root had no business keeping capabilities to a program's private
+  arena anyway; without the reuse this demo needed 34 slots. **Found a real
+  `lantern-kernel` bug**: every multi-program loader here calls `make_ready` on services
+  `admin::configure` had already enqueued, so they sat in the ready queue twice and a
+  stale entry later resumed a thread still blocked in `Recv`. First visible here as the
+  store's decrypt failing only when the guest read the empty file before writing. Fixed
+  in the kernel (`make_ready` is idempotent for an already-`Ready` thread, see its
+  STATUS.md). The loaders' redundant calls are now harmless and left as they are.
+
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.
