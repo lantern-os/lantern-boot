@@ -220,6 +220,16 @@ pub fn copy_cross(state: &mut KernelState, root: TcbId, source_cnode: CPtr, sour
     cnode::invoke(state, root, dest_cnode, &mut frame).expect("launcher copy_cross must succeed");
 }
 
+/// Clears `slot` in `root`'s own CSpace — a real `CNodeInvoke::Delete`, same
+/// trust tier as [`retype`]. Only drops this one capability; the object it
+/// named is untouched (this kernel has no reclaim).
+pub fn delete(state: &mut KernelState, root: TcbId, slot: CPtr) {
+    let mut frame = TrapFrame::zeroed();
+    frame.set_tag(lantern_hal::MessageTag { label: cnode::LABEL_DELETE, length: 0, extra_caps: 0, flags: 0 });
+    frame.set_mr(1, slot);
+    cnode::invoke(state, root, SELF_CNODE_CPTR, &mut frame).expect("launcher delete must succeed");
+}
+
 /// Where OpenSBI loads/enters this image (`linker.ld`'s `BASE_ADDRESS`) — the
 /// one megapage every loaded program's VSpace needs mapped, S-mode-only, for
 /// the trap vector/kernel dispatch/`sret` cold-start path to keep working once
@@ -452,9 +462,15 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
         // through `load`... CopyCross" reasoning as `self_cnode_dest` just
         // above, just sourced from `vspace_cptr` instead of `cnode_cptr`.
         copy_cross(state, root, SELF_CNODE_CPTR, vspace_cptr, cnode_cptr, arena.self_vspace_dest);
+        // One root scratch slot for the whole pool: retype, hand over, then
+        // drop root's own copy. The launcher has no use for capabilities to a
+        // program's private arena once granted (least privilege), and reusing
+        // the slot keeps a larger pool from eating root's fixed
+        // `CNODE_SLOTS`. `Delete` only clears the slot — the Frame object
+        // lives on behind the program's copy (no reclaim in this kernel).
+        let frame_cptr = *next_slot;
+        *next_slot += 1;
         for i in 0..arena.megapages {
-            let frame_cptr = *next_slot;
-            *next_slot += 1;
             let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr) else {
                 panic!("expected a Frame capability");
             };
@@ -462,6 +478,7 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
             // program itself decides when/where within `ARENA_VADDR` to map
             // each one (see the module doc).
             copy_cross(state, root, SELF_CNODE_CPTR, frame_cptr, cnode_cptr, arena.frame_dest_base + i);
+            delete(state, root, frame_cptr);
         }
     }
 
