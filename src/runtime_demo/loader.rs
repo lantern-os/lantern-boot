@@ -10,18 +10,23 @@
 //! - `lantern-runtime/confined-runtime/`: a confined `lantern-runtime` process
 //!   (Wasmtime `no_std` + Pulley) that takes that grant, backs a guest
 //!   component's `lantern:host/keystore` slot 0 with `IpcKeystore` over the
-//!   shared `Frame`, and runs `confined-probe-guest`'s `probe` export.
+//!   shared `Frame`, and runs `confined-probe-guest`'s `probe` export. The
+//!   guest is not in the runtime's image: it arrives as the signed package
+//!   `assets/probe.lpkg`, mapped read-only at `launch::PACKAGE_VADDR`, which
+//!   the runtime verifies against its own trusted publisher key before
+//!   deserializing.
 //!
 //! The runtime gets more than any earlier client: a 2 MiB private heap
 //! (Wasmtime bookkeeping, the Pulley interpreter stack; ~640 KiB measured) and an
-//! [`ArenaGrant`] of four unmapped `FrameMega`s plus its own VSpace, which
+//! [`ArenaGrant`] of three unmapped `FrameMega`s plus its own VSpace, which
 //! `lantern_runtime::platform` maps on demand for the deserialized `.cwasm`
-//! and the guest's linear memory. Neither is shared with, or visible to, the
+//! (one) and the guest's linear memory (two). Three is the measured minimum:
+//! with two, Wasmtime's `mmap` runs out and the runtime reports a panic. Neither is shared with, or visible to, the
 //! keystore-service. Only the endpoint, the shared `Frame`, and the two proof
 //! notifications are.
 //!
 //! `lantern-kernel`'s `MAX_FRAMES` is 16 system-wide. This demo uses 12: the
-//! runtime's image (2) + stack (1) + heap (1) + arena (4), the
+//! runtime's image (2) + stack (1) + heap (1) + arena (3) + package (1), the
 //! keystore-service's image (2) + stack (1), and the shared `Frame` (1).
 
 use lantern_kernel::cap::{Capability, CNode, CNodeId, CPtr, ObjectType, Rights, TcbId, UntypedId};
@@ -32,6 +37,10 @@ use crate::pmm;
 
 const KEYSTORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/keystore-service.elf");
 const CONFINED_RUNTIME_ELF: &[u8] = include_bytes!("../../assets/confined-runtime.elf");
+/// `confined-probe-guest`'s signed package, built by `lantern-sdk build` from
+/// `lantern-runtime/confined-probe-guest/` (see that crate's
+/// `lantern.capabilities.toml`).
+const PROBE_LPKG: &[u8] = include_bytes!("../../assets/probe.lpkg");
 
 /// Matches both loaded programs' own `ENDPOINT_CPTR`.
 const ENDPOINT_CPTR: CPtr = 1;
@@ -47,7 +56,7 @@ pub const RUNTIME_FAILURE_CPTR: CPtr = 4;
 /// `ARENA_FRAME_CPTR_BASE`, and `REGIONS` (that module's launcher contract).
 const RUNTIME_SELF_VSPACE_CPTR: CPtr = 6;
 const RUNTIME_ARENA_FRAME_CPTR_BASE: CPtr = 7;
-const RUNTIME_ARENA_MEGAPAGES: usize = 4;
+const RUNTIME_ARENA_MEGAPAGES: usize = 3;
 /// Matches `confined-runtime/src/main.rs`'s `HEAP_LEN` (one 2 MiB megapage).
 const RUNTIME_HEAP_MEGAPAGES: usize = 1;
 
@@ -57,7 +66,6 @@ const FRAME_VADDR: usize = 0x9000_0000;
 
 /// `keystore-service`'s `PROFILE_SIGNING`: an Ed25519 key, granted SIGN-only.
 const ARG0_KEYSTORE_SIGNING: usize = 1;
-const ARG0_RUNTIME: usize = 0;
 
 /// Sets up the loader's own privileged root identity, retypes the shared
 /// endpoint and the runtime's two proof notifications, loads both confined
@@ -111,10 +119,12 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_cnode_dest: Some(KEYSTORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
+            package: None,
         },
         ProgramSpec {
             elf_bytes: CONFINED_RUNTIME_ELF,
-            arg0: ARG0_RUNTIME,
+            // The runtime's `arg0` is its package's exact length.
+            arg0: PROBE_LPKG.len(),
             grants: &[
                 (endpoint_root_cptr, ENDPOINT_CPTR),
                 (success_root_cptr, RUNTIME_SUCCESS_CPTR),
@@ -127,6 +137,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 self_vspace_dest: RUNTIME_SELF_VSPACE_CPTR,
                 frame_dest_base: RUNTIME_ARENA_FRAME_CPTR_BASE,
             }),
+            package: Some(PROBE_LPKG),
         },
     ];
     let [service, runtime] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);

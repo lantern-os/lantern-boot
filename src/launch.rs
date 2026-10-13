@@ -103,6 +103,14 @@ pub const HEAP_VADDR: usize = STACK_VADDR + lantern_hal::RISCV64_MEGAPAGE_SIZE;
 #[allow(dead_code)]
 pub const ARENA_VADDR: usize = HEAP_VADDR + 16 * lantern_hal::RISCV64_MEGAPAGE_SIZE;
 
+/// Where a loaded program's optional signed guest package (see
+/// [`ProgramSpec::package`]) gets mapped, read-only — clear of the arena's
+/// 16-megapage range above [`ARENA_VADDR`] and below the RFC-0019 shared
+/// `Frame`s at `0x9000_0000`. Same "documented contract, duplicated by the
+/// program" status as [`ARENA_VADDR`]: `lantern-runtime/confined-runtime`'s
+/// `PACKAGE_VADDR` must match.
+pub const PACKAGE_VADDR: usize = 0x8c00_0000;
+
 pub const PERM_R: usize = 1 << 0;
 pub const PERM_W: usize = 1 << 1;
 pub const PERM_X: usize = 1 << 2;
@@ -141,6 +149,14 @@ pub struct ProgramSpec<'a> {
     /// can `FrameInvoke::Map`/`Unmap` them itself — see [`ArenaGrant`] and
     /// the module doc.
     pub arena: Option<ArenaGrant>,
+    /// If `Some`, these bytes (a signed `.lpkg`, at most one megapage) are
+    /// copied into a fresh `FrameMega` mapped **read-only** at
+    /// [`PACKAGE_VADDR`]. The program gets the mapping but no capability to
+    /// the Frame, so it can't unmap, remap or write it. The launcher is not
+    /// trusted for the bytes' integrity: the program verifies the package
+    /// signature itself. Pass the length in `arg0`; the rest of the megapage
+    /// is zero.
+    pub package: Option<&'a [u8]>,
 }
 
 /// See the module doc's `ArenaGrant` paragraph.
@@ -456,30 +472,51 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
         // program's own `dest_slot` gives it a real capability to itself.
         copy_cross(state, root, SELF_CNODE_CPTR, cnode_cptr, cnode_cptr, dest_slot);
     }
+    // One root scratch slot for every Frame this program gets but root keeps no
+    // capability to (the arena pool, the package): retype, hand over or map,
+    // then drop root's own copy. The launcher has no use for those
+    // capabilities afterwards (least privilege), and reusing the slot keeps
+    // them from eating root's fixed `CNODE_SLOTS`. `Delete` only clears the
+    // slot — the Frame object and any mapping of it live on (no reclaim in
+    // this kernel).
+    let scratch_cptr = if spec.arena.is_some() || spec.package.is_some() {
+        let slot = *next_slot;
+        *next_slot += 1;
+        slot
+    } else {
+        0
+    };
     if let Some(arena) = &spec.arena {
         // The program's own VSpace, so it can invoke `FrameInvoke::Map`/
         // `Unmap` naming itself — same "source doesn't exist until partway
         // through `load`... CopyCross" reasoning as `self_cnode_dest` just
         // above, just sourced from `vspace_cptr` instead of `cnode_cptr`.
         copy_cross(state, root, SELF_CNODE_CPTR, vspace_cptr, cnode_cptr, arena.self_vspace_dest);
-        // One root scratch slot for the whole pool: retype, hand over, then
-        // drop root's own copy. The launcher has no use for capabilities to a
-        // program's private arena once granted (least privilege), and reusing
-        // the slot keeps a larger pool from eating root's fixed
-        // `CNODE_SLOTS`. `Delete` only clears the slot — the Frame object
-        // lives on behind the program's copy (no reclaim in this kernel).
-        let frame_cptr = *next_slot;
-        *next_slot += 1;
         for i in 0..arena.megapages {
-            let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr) else {
+            let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, scratch_cptr) else {
                 panic!("expected a Frame capability");
             };
             // Deliberately no `map` call here — granted unmapped; the
             // program itself decides when/where within `ARENA_VADDR` to map
             // each one (see the module doc).
-            copy_cross(state, root, SELF_CNODE_CPTR, frame_cptr, cnode_cptr, arena.frame_dest_base + i);
-            delete(state, root, frame_cptr);
+            copy_cross(state, root, SELF_CNODE_CPTR, scratch_cptr, cnode_cptr, arena.frame_dest_base + i);
+            delete(state, root, scratch_cptr);
         }
+    }
+    if let Some(package) = spec.package {
+        assert!(package.len() <= mega, "a package must fit one megapage");
+        let Capability::Frame { id: frame_id, .. } =
+            retype(state, root, untyped_cptr, ObjectType::FrameMega, scratch_cptr)
+        else {
+            panic!("expected a Frame capability");
+        };
+        let paddr = state.frames.get(frame_id.0 as usize).unwrap().paddr;
+        // SAFETY: as pass 3's segment copy above — a Frame just retyped,
+        // zeroed, exclusively the launcher's, identity-mapped here; `package`
+        // fits it (asserted).
+        unsafe { core::ptr::copy_nonoverlapping(package.as_ptr(), paddr as *mut u8, package.len()) };
+        map(state, root, scratch_cptr, vspace_cptr, PACKAGE_VADDR, PERM_R | PERM_U);
+        delete(state, root, scratch_cptr);
     }
 
     let sched_cptr = *next_slot;

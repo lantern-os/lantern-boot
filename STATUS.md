@@ -409,6 +409,20 @@
   store's decrypt failing only when the guest read the empty file before writing. Fixed
   in the kernel (`make_ready` is idempotent for an already-`Ready` thread, see its
   STATUS.md). The loaders' redundant calls are now harmless and left as they are.
+- **The runtime demos hand their guest over as a signed package (2026-10-12).** New
+  `ProgramSpec::package`: the launcher copies a `.lpkg` into a fresh `FrameMega`, maps it
+  **read-only** at the new `launch::PACKAGE_VADDR` (`0x8c00_0000`), and drops its own
+  capability. The program gets the mapping but no capability, so it can't remap or write
+  it. Both runtime demos now pass `assets/probe.lpkg` / `assets/fs-probe.lpkg`
+  (`lantern-sdk build` output, copied from `lantern-runtime`) with the length in `arg0`.
+  The runtime verifies the signature itself, so the launcher is not trusted for those
+  bytes. The arena dropped from 4 to 3 `FrameMega`s, measured as the minimum for both
+  guests (with 2, Wasmtime's `mmap` runs out). That frees exactly the frame the package
+  needs, so `runtime-fs-demo` is still `MAX_FRAMES` 16/16. The package and the arena pool
+  now share one root scratch slot, so root `CNODE_SLOTS` is still 31/32. All 8 demos
+  pass. Both runtime demos give 5/5 identical `SUCCESS` across `-m 64M`–`512M`. Feeding
+  `runtime-fs-demo` a tampered, foreign-signed, or truncated package makes the runtime
+  signal `FAILURE` at stage 9 every time (see `lantern-runtime/STATUS.md`).
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS

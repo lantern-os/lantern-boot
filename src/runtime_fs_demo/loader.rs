@@ -7,7 +7,9 @@
 //! `../../keystore-service/` (AEAD profile) ← `../../store-service/` ←
 //! `lantern-runtime/confined-runtime`'s `lantern-confined-runtime-fs`, a
 //! confined `lantern-runtime` process hosting `confined-fs-guest` whose
-//! `filesystem` slot 0 is `IpcFilesystem` over the second shared `Frame`.
+//! `filesystem` slot 0 is `IpcFilesystem` over the second shared `Frame`. The
+//! guest arrives as the signed package `assets/fs-probe.lpkg`, mapped
+//! read-only (see `runtime_demo/loader.rs`'s module doc).
 //! Every guest `read`/`write` crosses three confined programs, and the
 //! store-service seals each block through its own grant on the
 //! keystore-service — a key neither the runtime nor the guest can name.
@@ -17,10 +19,12 @@
 //! READ|WRITE file access live from store-service.
 //!
 //! **This demo sits at two of the kernel's fixed limits.** `MAX_FRAMES` (16):
-//! the runtime's image (2) + stack (1) + heap (1) + arena (4), each service's
-//! image (2) + stack (1), and the two shared `Frame`s — exactly 16. Root's
-//! `CNODE_SLOTS` (32): 31 used, which fits only because `launch::load` now
-//! reuses one root scratch slot for an `ArenaGrant`'s whole pool. A fourth
+//! the runtime's image (2) + stack (1) + heap (1) + arena (3) + package (1),
+//! each service's image (2) + stack (1), and the two shared `Frame`s —
+//! exactly 16. The package fits only because the arena dropped from 4 to its
+//! measured minimum of 3. Root's `CNODE_SLOTS` (32): 31 used, which fits only
+//! because `launch::load` reuses one root scratch slot for an `ArenaGrant`'s
+//! whole pool and the package. A fourth
 //! program, or any growth here, needs those limits raised — a kernel decision,
 //! not a launcher one.
 
@@ -33,6 +37,10 @@ use crate::pmm;
 const KEYSTORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/keystore-service.elf");
 const STORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/store-service.elf");
 const CONFINED_RUNTIME_FS_ELF: &[u8] = include_bytes!("../../assets/confined-runtime-fs.elf");
+/// `confined-fs-guest`'s signed package, built by `lantern-sdk build` from
+/// `lantern-runtime/confined-fs-guest/` (see that crate's
+/// `lantern.capabilities.toml`).
+const FS_PROBE_LPKG: &[u8] = include_bytes!("../../assets/fs-probe.lpkg");
 
 /// As `store_demo/loader.rs`'s constants of the same names.
 const KS_ENDPOINT_CPTR: CPtr = 1;
@@ -54,13 +62,12 @@ const RUNTIME_FRAME_VADDR: usize = 0x9000_0000;
 /// (`lantern-runtime/src/platform.rs`'s launcher contract).
 const RUNTIME_SELF_VSPACE_CPTR: CPtr = 6;
 const RUNTIME_ARENA_FRAME_CPTR_BASE: CPtr = 7;
-const RUNTIME_ARENA_MEGAPAGES: usize = 4;
+const RUNTIME_ARENA_MEGAPAGES: usize = 3;
 const RUNTIME_HEAP_MEGAPAGES: usize = 1;
 
 /// `keystore-service`'s `PROFILE_AEAD`: the store's sealing key.
 const ARG0_KEYSTORE_AEAD: usize = 0;
 const ARG0_STORE: usize = 1;
-const ARG0_RUNTIME: usize = 2;
 
 /// Sets up the loader's own privileged root identity, retypes both shared
 /// endpoints and the runtime's two proof notifications, loads all three
@@ -116,6 +123,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_cnode_dest: Some(KEYSTORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
+            package: None,
         },
         ProgramSpec {
             elf_bytes: STORE_SERVICE_ELF,
@@ -129,10 +137,12 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_cnode_dest: Some(STORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
+            package: None,
         },
         ProgramSpec {
             elf_bytes: CONFINED_RUNTIME_FS_ELF,
-            arg0: ARG0_RUNTIME,
+            // The runtime's `arg0` is its package's exact length.
+            arg0: FS_PROBE_LPKG.len(),
             grants: &[
                 (ss_endpoint_root_cptr, RUNTIME_ENDPOINT_CPTR),
                 (success_root_cptr, RUNTIME_SUCCESS_CPTR),
@@ -145,6 +155,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 self_vspace_dest: RUNTIME_SELF_VSPACE_CPTR,
                 frame_dest_base: RUNTIME_ARENA_FRAME_CPTR_BASE,
             }),
+            package: Some(FS_PROBE_LPKG),
         },
     ];
     let [keystore, store, runtime] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
