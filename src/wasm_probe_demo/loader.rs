@@ -116,6 +116,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_vspace_dest: PROBE_SELF_VSPACE_CPTR,
             frame_dest_base: PROBE_ARENA_FRAME_CPTR_BASE,
         }),
+        package: None,
     }];
     let [probe] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
 

@@ -98,6 +98,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_cnode_dest: Some(BROKER_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
+            package: None,
         },
         ProgramSpec {
             elf_bytes: BROKER_CLIENT_ELF,
@@ -106,6 +107,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_cnode_dest: None,
             heap_megapages: 0,
             arena: None,
+            package: None,
         },
     ];
     let [broker, client] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
