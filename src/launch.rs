@@ -149,14 +149,6 @@ pub struct ProgramSpec<'a> {
     /// can `FrameInvoke::Map`/`Unmap` them itself — see [`ArenaGrant`] and
     /// the module doc.
     pub arena: Option<ArenaGrant>,
-    /// If `Some`, these bytes (a signed `.lpkg`, at most one megapage) are
-    /// copied into a fresh `FrameMega` mapped **read-only** at
-    /// [`PACKAGE_VADDR`]. The program gets the mapping but no capability to
-    /// the Frame, so it can't unmap, remap or write it. The launcher is not
-    /// trusted for the bytes' integrity: the program verifies the package
-    /// signature itself. Pass the length in `arg0`; the rest of the megapage
-    /// is zero.
-    pub package: Option<&'a [u8]>,
 }
 
 /// See the module doc's `ArenaGrant` paragraph.
@@ -171,6 +163,26 @@ pub struct ArenaGrant {
     /// granted (unmapped) Frame capabilities.
     pub frame_dest_base: CPtr,
 }
+
+/// `lantern_abi::grant::GRANTER_BADGE` (RFC-0020): what the launcher mints onto
+/// the launch binder's copy of a service endpoint. This crate doesn't link
+/// `lantern-abi`, so this has to match by hand; a mismatch fails closed.
+#[allow(dead_code)]
+pub const GRANTER_BADGE: u64 = (1 << 56) - 1;
+/// `lantern_abi::grant::BINDER_LAUNCHED`: an `arg0` flag telling a service it
+/// grants only over `GRANT`, never to its first caller.
+#[allow(dead_code)]
+pub const BINDER_LAUNCHED: usize = 1 << 8;
+/// The launch binder's capability slots (`lantern-shell/launch-binder/src/main.rs`).
+#[allow(dead_code)]
+pub const BINDER_ENDPOINT_CPTR: CPtr = 1;
+#[allow(dead_code)]
+pub const BINDER_KEYSTORE_GRANTER_CPTR: CPtr = 2;
+#[allow(dead_code)]
+pub const BINDER_STORE_GRANTER_CPTR: CPtr = 3;
+/// The launch binder's heap, in `FrameMega`s (its `HEAP_LEN`).
+#[allow(dead_code)]
+pub const BINDER_HEAP_MEGAPAGES: usize = 1;
 
 /// Root's own CNode capability slot, in its own CSpace — every caller of this
 /// module uses slot 0 for it, by convention established when `loader.rs`
@@ -247,14 +259,16 @@ pub fn delete(state: &mut KernelState, root: TcbId, slot: CPtr) {
 }
 
 /// Where OpenSBI loads/enters this image (`linker.ld`'s `BASE_ADDRESS`) — the
-/// one megapage every loaded program's VSpace needs mapped, S-mode-only, for
+/// megapages every loaded program's VSpace needs mapped, S-mode-only, for
 /// the trap vector/kernel dispatch/`sret` cold-start path to keep working once
 /// that program's own table is active (RISC-V traps don't switch page
-/// tables).
+/// tables). Two of them, which `linker.ld` asserts the image fits; they end at
+/// `pmm::GENERAL_MEMORY_BASE`.
 const KERNEL_MEGAPAGE_BASE: usize = 0x8020_0000;
+const KERNEL_MEGAPAGE_2_BASE: usize = 0x8040_0000;
 const UART_MEGAPAGE_BASE: usize = 0x1000_0000;
 
-/// Maps [`KERNEL_MEGAPAGE_BASE`] and the UART megapage into `vspace_id`'s root
+/// Maps both kernel megapages and the UART megapage into `vspace_id`'s root
 /// table, S-mode-only (no `USER` flag) — **not** through `FrameInvoke::Map`:
 /// these aren't retyped `Frame` objects, and `lantern-kernel` itself has no
 /// business knowing `lantern-boot`'s own kernel-image layout. See
@@ -275,17 +289,13 @@ pub fn map_kernel_shared(state: &mut KernelState, vspace_id: VSpaceId) {
         .union(lantern_hal::Riscv64PteFlags::EXECUTE);
     let mmio_flags = lantern_hal::Riscv64PteFlags::READ.union(lantern_hal::Riscv64PteFlags::WRITE);
 
-    for &(vaddr, paddr, flags) in
-        &[(KERNEL_MEGAPAGE_BASE, KERNEL_MEGAPAGE_BASE, kernel_flags), (UART_MEGAPAGE_BASE, UART_MEGAPAGE_BASE, mmio_flags)]
-    {
-        // Pre-allocate the one page `map_megapage` might need for a fresh L1
-        // table, same reasoning as `lantern_kernel::frame::map`'s identical
-        // pattern (its own doc comment has the full explanation).
-        let spare = state
-            .kernel_page_tables
-            .alloc()
-            .expect("the kernel's own page-table arena must have room for kernel-shared L1 tables");
-        let mut alloc = move || spare;
+    let tables = &mut state.kernel_page_tables;
+    let mut alloc = || tables.alloc().expect("the kernel's own page-table arena must have room for kernel-shared L1 tables");
+    for &(vaddr, paddr, flags) in &[
+        (KERNEL_MEGAPAGE_BASE, KERNEL_MEGAPAGE_BASE, kernel_flags),
+        (KERNEL_MEGAPAGE_2_BASE, KERNEL_MEGAPAGE_2_BASE, kernel_flags),
+        (UART_MEGAPAGE_BASE, UART_MEGAPAGE_BASE, mmio_flags),
+    ] {
         // SAFETY: `vspace_root` is this VSpace's own freshly built, exclusively
         // owned root table; `vaddr`/`paddr` are megapage-aligned machine
         // constants.
@@ -472,21 +482,15 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
         // program's own `dest_slot` gives it a real capability to itself.
         copy_cross(state, root, SELF_CNODE_CPTR, cnode_cptr, cnode_cptr, dest_slot);
     }
-    // One root scratch slot for every Frame this program gets but root keeps no
-    // capability to (the arena pool, the package): retype, hand over or map,
-    // then drop root's own copy. The launcher has no use for those
-    // capabilities afterwards (least privilege), and reusing the slot keeps
-    // them from eating root's fixed `CNODE_SLOTS`. `Delete` only clears the
-    // slot — the Frame object and any mapping of it live on (no reclaim in
-    // this kernel).
-    let scratch_cptr = if spec.arena.is_some() || spec.package.is_some() {
-        let slot = *next_slot;
-        *next_slot += 1;
-        slot
-    } else {
-        0
-    };
     if let Some(arena) = &spec.arena {
+        // One root scratch slot for every Frame this program gets but root keeps
+        // no capability to: retype, hand over, then drop root's own copy. The
+        // launcher has no use for those capabilities afterwards (least
+        // privilege), and reusing the slot keeps them from eating root's fixed
+        // `CNODE_SLOTS`. `Delete` only clears the slot — the Frame object lives
+        // on (no reclaim in this kernel).
+        let scratch_cptr = *next_slot;
+        *next_slot += 1;
         // The program's own VSpace, so it can invoke `FrameInvoke::Map`/
         // `Unmap` naming itself — same "source doesn't exist until partway
         // through `load`... CopyCross" reasoning as `self_cnode_dest` just
@@ -503,22 +507,6 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
             delete(state, root, scratch_cptr);
         }
     }
-    if let Some(package) = spec.package {
-        assert!(package.len() <= mega, "a package must fit one megapage");
-        let Capability::Frame { id: frame_id, .. } =
-            retype(state, root, untyped_cptr, ObjectType::FrameMega, scratch_cptr)
-        else {
-            panic!("expected a Frame capability");
-        };
-        let paddr = state.frames.get(frame_id.0 as usize).unwrap().paddr;
-        // SAFETY: as pass 3's segment copy above — a Frame just retyped,
-        // zeroed, exclusively the launcher's, identity-mapped here; `package`
-        // fits it (asserted).
-        unsafe { core::ptr::copy_nonoverlapping(package.as_ptr(), paddr as *mut u8, package.len()) };
-        map(state, root, scratch_cptr, vspace_cptr, PACKAGE_VADDR, PERM_R | PERM_U);
-        delete(state, root, scratch_cptr);
-    }
-
     let sched_cptr = *next_slot;
     *next_slot += 1;
     let Capability::SchedContext { .. } = retype(state, root, untyped_cptr, ObjectType::SchedContext, sched_cptr) else {
@@ -593,4 +581,37 @@ pub fn map_shared_frame(
     };
     map(state, root, frame_cptr, vspace_a, vaddr_a, PERM_R | PERM_W | PERM_U);
     map(state, root, frame_cptr, vspace_b, vaddr_b, PERM_R | PERM_W | PERM_U);
+}
+
+/// Copies `package` (a signed `.lpkg`, at most one megapage) into a fresh
+/// `FrameMega` and maps it **read-only** at [`PACKAGE_VADDR`] in each of
+/// `vspaces`: the launch binder and the runtime verify the same immutable bytes
+/// ([RFC-0020](../../lantern-rfcs/rfcs/0020-launch-binder.md)). Neither program
+/// gets a capability to the Frame, and root drops its own, so nothing can remap
+/// or write it. The launcher is not trusted for the bytes' integrity: each
+/// program verifies the signature itself. Pass the length in `arg0`; the rest of
+/// the megapage is zero.
+#[allow(dead_code)]
+pub fn map_package(
+    state: &mut KernelState,
+    root: TcbId,
+    untyped_cptr: CPtr,
+    package: &[u8],
+    vspaces: &[CPtr],
+    next_slot: &mut CPtr,
+) {
+    assert!(package.len() <= lantern_hal::RISCV64_MEGAPAGE_SIZE, "a package must fit one megapage");
+    let frame_cptr = *next_slot;
+    let Capability::Frame { id: frame_id, .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr) else {
+        panic!("expected a Frame capability");
+    };
+    let paddr = state.frames.get(frame_id.0 as usize).unwrap().paddr;
+    // SAFETY: as `load`'s segment copy — a Frame just retyped, zeroed,
+    // exclusively the launcher's, identity-mapped here; `package` fits it
+    // (asserted).
+    unsafe { core::ptr::copy_nonoverlapping(package.as_ptr(), paddr as *mut u8, package.len()) };
+    for &vspace in vspaces {
+        map(state, root, frame_cptr, vspace, PACKAGE_VADDR, PERM_R | PERM_U);
+    }
+    delete(state, root, frame_cptr);
 }

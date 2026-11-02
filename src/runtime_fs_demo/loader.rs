@@ -19,15 +19,16 @@
 //! its AEAD access live from keystore-service, and the runtime gets its
 //! READ|WRITE file access live from store-service.
 //!
-//! **This demo sits at two of the kernel's fixed limits.** `MAX_FRAMES` (16):
-//! the runtime's image (2) + stack (1) + heap (1) + arena (3) + package (1),
-//! each service's image (2) + stack (1), and the two shared `Frame`s —
-//! exactly 16. The package fits only because the arena dropped from 4 to its
-//! measured minimum of 3. Root's `CNODE_SLOTS` (32): 31 used, which fits only
-//! because `launch::load` reuses one root scratch slot for an `ArenaGrant`'s
-//! whole pool and the package. A fourth
-//! program, or any growth here, needs those limits raised — a kernel decision,
-//! not a launcher one.
+//! The launch binder ([RFC-0020](../../../lantern-rfcs/rfcs/0020-launch-binder.md))
+//! sits between the runtime and store-service, as in `runtime_demo`: the runtime
+//! holds no endpoint to store-service until the binder decides it should. The
+//! store-service's own grant from keystore-service is launcher-fixed infrastructure
+//! rather than an app's request, and it stays a first-caller grant.
+//!
+//! **This is the largest demo, and what `lantern-kernel/src/limits.rs` is sized
+//! from.** Frames: the runtime's image (2) + stack (1) + heap (1) + arena (3),
+//! the shared package (1), each service's image (2) + stack (1), the binder's
+//! image (2) + stack (1) + heap (1), and the two shared `Frame`s: 20.
 
 use lantern_kernel::cap::{Capability, CNode, CNodeId, CPtr, ObjectType, Rights, TcbId, UntypedId};
 use lantern_kernel::object::{Tcb, Untyped};
@@ -38,6 +39,7 @@ use crate::pmm;
 const KEYSTORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/keystore-service.elf");
 const STORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/store-service.elf");
 const CONFINED_RUNTIME_ELF: &[u8] = include_bytes!("../../assets/confined-runtime.elf");
+const LAUNCH_BINDER_ELF: &[u8] = include_bytes!("../../assets/launch-binder.elf");
 /// `confined-fs-guest`'s signed package, built by `lantern-sdk build` from
 /// `lantern-runtime/confined-fs-guest/` (see that crate's
 /// `lantern.capabilities.toml`).
@@ -109,6 +111,19 @@ pub unsafe fn run(mem_end: usize) -> ! {
     next_slot += 1;
     launch::retype(state, root, untyped_cptr, ObjectType::Endpoint, ss_endpoint_root_cptr);
 
+    // RFC-0020: only the binder can ask the service for a grant, and it asks
+    // under a badge the kernel delivers. The runtime gets only a way to ask
+    // the binder.
+    let granter_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, ss_endpoint_root_cptr, granter_root_cptr, Rights::WRITE, launch::GRANTER_BADGE);
+    let binder_endpoint_root_cptr = next_slot;
+    next_slot += 1;
+    launch::retype(state, root, untyped_cptr, ObjectType::Endpoint, binder_endpoint_root_cptr);
+    let binder_client_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, binder_endpoint_root_cptr, binder_client_root_cptr, Rights::WRITE, 0);
+
     let success_root_cptr = next_slot;
     next_slot += 1;
     launch::retype(state, root, untyped_cptr, ObjectType::Notification, success_root_cptr);
@@ -124,11 +139,10 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_cnode_dest: Some(KEYSTORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
-            package: None,
         },
         ProgramSpec {
             elf_bytes: STORE_SERVICE_ELF,
-            arg0: ARG0_STORE,
+            arg0: ARG0_STORE | launch::BINDER_LAUNCHED,
             // store-service's own retained authority is its endpoint to
             // the runtime (STORE_SERVICE_OWN_ENDPOINT_CPTR, its own
             // Broker::mint source — keystore-service's identical convention);
@@ -138,14 +152,25 @@ pub unsafe fn run(mem_end: usize) -> ! {
             self_cnode_dest: Some(STORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
-            package: None,
+        },
+        ProgramSpec {
+            elf_bytes: LAUNCH_BINDER_ELF,
+            // The binder's `arg0` is the package's exact length, as the runtime's.
+            arg0: FS_PROBE_LPKG.len(),
+            grants: &[
+                (binder_endpoint_root_cptr, launch::BINDER_ENDPOINT_CPTR),
+                (granter_root_cptr, launch::BINDER_STORE_GRANTER_CPTR),
+            ],
+            self_cnode_dest: None,
+            heap_megapages: launch::BINDER_HEAP_MEGAPAGES,
+            arena: None,
         },
         ProgramSpec {
             elf_bytes: CONFINED_RUNTIME_ELF,
             // The runtime's `arg0` is its package's exact length.
             arg0: FS_PROBE_LPKG.len(),
             grants: &[
-                (ss_endpoint_root_cptr, RUNTIME_ENDPOINT_CPTR),
+                (binder_client_root_cptr, RUNTIME_ENDPOINT_CPTR),
                 (success_root_cptr, RUNTIME_SUCCESS_CPTR),
                 (failure_root_cptr, RUNTIME_FAILURE_CPTR),
             ],
@@ -156,10 +181,11 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 self_vspace_dest: RUNTIME_SELF_VSPACE_CPTR,
                 frame_dest_base: RUNTIME_ARENA_FRAME_CPTR_BASE,
             }),
-            package: Some(FS_PROBE_LPKG),
         },
     ];
-    let [keystore, store, runtime] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
+    let [keystore, store, binder, runtime] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
+
+    launch::map_package(state, root, untyped_cptr, FS_PROBE_LPKG, &[binder.vspace_cptr, runtime.vspace_cptr], &mut next_slot);
 
     // ADR-0022 Part 2: two independent shared Frames — see the module doc.
     launch::map_shared_frame(
@@ -185,6 +211,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
 
     state.make_ready(keystore.tcb);
     state.make_ready(store.tcb);
+    state.make_ready(binder.tcb);
 
     crate::println!("runtime-fs-demo: entering the confined runtime (loaded ELF, own VSpace, U-mode)");
     // SAFETY: first and only call on this hart; all three programs' contexts

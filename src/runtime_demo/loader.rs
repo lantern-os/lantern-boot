@@ -1,20 +1,24 @@
 //! Boots the RFC-0018 integration demo — a **seventh, isolated boot image**
 //! (same separateness reasoning `broker_demo/loader.rs`'s module doc gives).
 //!
-//! Two confined programs, the `keystore_demo` topology with its client
-//! swapped for a real runtime:
+//! Three confined programs, the `keystore_demo` topology with its client
+//! swapped for a real runtime, and a launch binder between them
+//! ([RFC-0020](../../../lantern-rfcs/rfcs/0020-launch-binder.md)):
 //!
-//! - `../../keystore-service/`, launched with `arg0 = PROFILE_SIGNING`: one
-//!   Ed25519 key, which it grants SIGN-only (via its own confined `Broker`,
-//!   live over IPC) to whoever `Call`s first.
+//! - `../../keystore-service/`, launched with `arg0 = PROFILE_SIGNING |
+//!   BINDER_LAUNCHED`: one Ed25519 key, which it grants (via its own confined
+//!   `Broker`, live over IPC) only over `GRANT`, from the binder.
+//! - `lantern-shell/launch-binder/`: holds the only `GRANTER_BADGE`d copy of the
+//!   service's endpoint, verifies the package, and decides each request.
 //! - `lantern-runtime/confined-runtime/`: a confined `lantern-runtime` process
-//!   (Wasmtime `no_std` + Pulley) that takes that grant, backs a guest
-//!   component's `lantern:host/keystore` slot 0 with `IpcKeystore` over the
-//!   shared `Frame`, and runs `confined-probe-guest`'s `probe` export. The
-//!   guest is not in the runtime's image: it arrives as the signed package
-//!   `assets/probe.lpkg`, mapped read-only at `launch::PACKAGE_VADDR`, which
-//!   the runtime verifies against its own trusted publisher key before
-//!   deserializing. Its manifest is what selects `keystore` as the wiring.
+//!   (Wasmtime `no_std` + Pulley) holding **no** service endpoint. It asks the
+//!   binder for its grant, backs a guest component's `lantern:host/keystore`
+//!   slot 0 with `IpcKeystore` over the shared `Frame`, and runs
+//!   `confined-probe-guest`'s `probe` export. The guest is not in the runtime's
+//!   image: it arrives as the signed package `assets/probe.lpkg`, one `Frame`
+//!   mapped read-only at `launch::PACKAGE_VADDR` in both the runtime and the
+//!   binder, each of which verifies it. Its manifest is what selects `keystore`
+//!   as the wiring.
 //!
 //! The runtime gets more than any earlier client: a 2 MiB private heap
 //! (Wasmtime bookkeeping, the Pulley interpreter stack; ~640 KiB measured) and an
@@ -22,12 +26,12 @@
 //! `lantern_runtime::platform` maps on demand for the deserialized `.cwasm`
 //! (one) and the guest's linear memory (two). Three is the measured minimum:
 //! with two, Wasmtime's `mmap` runs out and the runtime reports a panic. Neither is shared with, or visible to, the
-//! keystore-service. Only the endpoint, the shared `Frame`, and the two proof
-//! notifications are.
+//! keystore-service.
 //!
-//! `lantern-kernel`'s `MAX_FRAMES` is 16 system-wide. This demo uses 12: the
-//! runtime's image (2) + stack (1) + heap (1) + arena (3) + package (1), the
-//! keystore-service's image (2) + stack (1), and the shared `Frame` (1).
+//! `lantern-kernel`'s `MAX_FRAMES` is system-wide. This demo uses 16: the
+//! runtime's image (2) + stack (1) + heap (1) + arena (3), the shared package
+//! (1), the keystore-service's image (2) + stack (1), the binder's image (2) +
+//! stack (1) + heap (1), and the shared `Frame` (1).
 
 use lantern_kernel::cap::{Capability, CNode, CNodeId, CPtr, ObjectType, Rights, TcbId, UntypedId};
 use lantern_kernel::object::{Tcb, Untyped};
@@ -37,12 +41,14 @@ use crate::pmm;
 
 const KEYSTORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/keystore-service.elf");
 const CONFINED_RUNTIME_ELF: &[u8] = include_bytes!("../../assets/confined-runtime.elf");
+const LAUNCH_BINDER_ELF: &[u8] = include_bytes!("../../assets/launch-binder.elf");
 /// `confined-probe-guest`'s signed package, built by `lantern-sdk build` from
 /// `lantern-runtime/confined-probe-guest/` (see that crate's
 /// `lantern.capabilities.toml`).
 const PROBE_LPKG: &[u8] = include_bytes!("../../assets/probe.lpkg");
 
-/// Matches both loaded programs' own `ENDPOINT_CPTR`.
+/// Matches the keystore-service's own `ENDPOINT_CPTR`, and the runtime's slot
+/// for the binder's endpoint.
 const ENDPOINT_CPTR: CPtr = 1;
 /// Matches `keystore-service`'s own `SELF_CNODE_CPTR` (see
 /// `keystore_demo/loader.rs`'s `KEYSTORE_SELF_CNODE_CPTR`).
@@ -102,6 +108,19 @@ pub unsafe fn run(mem_end: usize) -> ! {
     next_slot += 1;
     launch::retype(state, root, untyped_cptr, ObjectType::Endpoint, endpoint_root_cptr);
 
+    // RFC-0020: only the binder can ask the service for a grant, and it asks
+    // under a badge the kernel delivers. The runtime gets only a way to ask
+    // the binder.
+    let granter_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, endpoint_root_cptr, granter_root_cptr, Rights::WRITE, launch::GRANTER_BADGE);
+    let binder_endpoint_root_cptr = next_slot;
+    next_slot += 1;
+    launch::retype(state, root, untyped_cptr, ObjectType::Endpoint, binder_endpoint_root_cptr);
+    let binder_client_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, binder_endpoint_root_cptr, binder_client_root_cptr, Rights::WRITE, 0);
+
     let success_root_cptr = next_slot;
     next_slot += 1;
     launch::retype(state, root, untyped_cptr, ObjectType::Notification, success_root_cptr);
@@ -112,21 +131,32 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let specs = [
         ProgramSpec {
             elf_bytes: KEYSTORE_SERVICE_ELF,
-            arg0: ARG0_KEYSTORE_SIGNING,
-            // Rights::ALL, as in keystore_demo: the service mints the
-            // runtime's attenuated, badged copy from this.
+            arg0: ARG0_KEYSTORE_SIGNING | launch::BINDER_LAUNCHED,
+            // Rights::ALL, as in keystore_demo: the service mints each
+            // attenuated, badged copy from this.
             grants: &[(endpoint_root_cptr, ENDPOINT_CPTR)],
             self_cnode_dest: Some(KEYSTORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
-            package: None,
+        },
+        ProgramSpec {
+            elf_bytes: LAUNCH_BINDER_ELF,
+            // The binder's `arg0` is the package's exact length, as the runtime's.
+            arg0: PROBE_LPKG.len(),
+            grants: &[
+                (binder_endpoint_root_cptr, launch::BINDER_ENDPOINT_CPTR),
+                (granter_root_cptr, launch::BINDER_KEYSTORE_GRANTER_CPTR),
+            ],
+            self_cnode_dest: None,
+            heap_megapages: launch::BINDER_HEAP_MEGAPAGES,
+            arena: None,
         },
         ProgramSpec {
             elf_bytes: CONFINED_RUNTIME_ELF,
             // The runtime's `arg0` is its package's exact length.
             arg0: PROBE_LPKG.len(),
             grants: &[
-                (endpoint_root_cptr, ENDPOINT_CPTR),
+                (binder_client_root_cptr, ENDPOINT_CPTR),
                 (success_root_cptr, RUNTIME_SUCCESS_CPTR),
                 (failure_root_cptr, RUNTIME_FAILURE_CPTR),
             ],
@@ -137,10 +167,11 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 self_vspace_dest: RUNTIME_SELF_VSPACE_CPTR,
                 frame_dest_base: RUNTIME_ARENA_FRAME_CPTR_BASE,
             }),
-            package: Some(PROBE_LPKG),
         },
     ];
-    let [service, runtime] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
+    let [service, binder, runtime] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
+
+    launch::map_package(state, root, untyped_cptr, PROBE_LPKG, &[binder.vspace_cptr, runtime.vspace_cptr], &mut next_slot);
 
     // ADR-0022 Part 2: one shared Frame, mapped read/write into both
     // programs' own VSpaces.
@@ -156,6 +187,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
     );
 
     state.make_ready(service.tcb);
+    state.make_ready(binder.tcb);
 
     crate::println!("runtime-demo: entering the confined runtime (loaded ELF, own VSpace, U-mode)");
     // SAFETY: first and only call on this hart; the runtime's context and

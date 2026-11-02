@@ -35,16 +35,21 @@
 //! piece of launch-time configuration it takes: [`PROFILE_AEAD`] (an AEAD key,
 //! ENCRYPT|DECRYPT; `keystore_demo`/`store_demo`) or [`PROFILE_SIGNING`] (an
 //! Ed25519 key, SIGN only; `runtime_demo`, where the client is a confined
-//! `lantern-runtime` hosting a guest component that only ever signs).
+//! `lantern-runtime` hosting a guest component that only ever signs). The
+//! [`grant::BINDER_LAUNCHED`] flag drops phase 1: this instance then grants only
+//! over [RFC-0020](../../lantern-rfcs/rfcs/0020-launch-binder.md)'s `GRANT`, from
+//! the launch binder, and never to its first caller. In every mode, a `GRANT`
+//! from anyone else is refused `ACCESS`.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::Channel;
+use lantern_abi::frame::{status, Channel};
+use lantern_abi::grant::{self, Incoming};
 use lantern_abi::sys;
 use lantern_capabilities::Abi;
-use lantern_crypto::{KeyOps, Keystore};
+use lantern_crypto::{KeyId, KeyOps, Keystore};
 
 lantern_abi::entry!(run);
 
@@ -82,7 +87,7 @@ const REQUEST_CAP: usize = 256;
 
 fn run(arg0: usize) -> ! {
     let mut keystore = Keystore::new(SELF_CNODE_CPTR);
-    let (key, ops) = match arg0 {
+    let (key, ops) = match arg0 & !grant::BINDER_LAUNCHED {
         PROFILE_SIGNING => (keystore.generate_signing_key(DEMO_SIGNING_SEED), KeyOps::SIGN),
         PROFILE_AEAD => (keystore.generate_aead_key(DEMO_AEAD_SEED), KeyOps::ENCRYPT.union(KeyOps::DECRYPT)),
         _ => panic!("keystore-service: unknown arg0 profile"),
@@ -92,32 +97,65 @@ fn run(arg0: usize) -> ! {
 
     // Phase 1: one client Call's, registering its own reply-leg destination;
     // grant it `ops` on the one demo key.
-    let _ = sys::recv(ENDPOINT_CPTR);
-    if let Ok(()) = keystore
-        .request_key_access(&mut backend, key, ops, ENDPOINT_CPTR, SCRATCH_CPTR)
-        .and_then(|_badge| keystore.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)))
-    {
-        // Phase 2: serve RFC-0019 wire requests on the same endpoint — the
-        // client's granted capability is a badged copy of it.
-        //
-        // SAFETY: the loader mapped `FRAME_VADDR..+FRAME_LEN` read/write into
-        // this program's own VSpace before its first instruction ran
-        // (`keystore_demo/loader.rs`'s `map_shared_frame` call).
-        let mut channel = unsafe { Channel::new(ENDPOINT_CPTR, FRAME_VADDR as *mut u8) };
-        loop {
-            let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
-            let mut request = [0u8; REQUEST_CAP];
-            if let Ok((op, len)) = channel.recv_request(received, &mut request) {
-                let mut reply = [0u8; REQUEST_CAP];
-                let (status, reply_len) =
-                    lantern_crypto::wire::handle_request(&keystore, received.badge, op, &request[..len], &mut reply);
-                let _ = channel.reply(status, &reply[..reply_len]);
+    if arg0 & grant::BINDER_LAUNCHED == 0 {
+        let _ = sys::recv(ENDPOINT_CPTR);
+        let granted = keystore
+            .request_key_access(&mut backend, key, ops, ENDPOINT_CPTR, SCRATCH_CPTR)
+            .and_then(|_badge| keystore.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)));
+        if granted.is_err() {
+            loop {
+                core::hint::spin_loop();
             }
-            // `recv_request`'s `Err` path has already sent `INVALID` itself.
         }
+        // `Reply` copies a transferred capability; a later `GRANT` needs this slot empty.
+        let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
     }
 
+    // Phase 2: serve RFC-0019 wire requests on the same endpoint — the
+    // client's granted capability is a badged copy of it.
+    //
+    // SAFETY: the loader mapped `FRAME_VADDR..+FRAME_LEN` read/write into
+    // this program's own VSpace before its first instruction ran
+    // (`keystore_demo/loader.rs`'s `map_shared_frame` call).
+    let mut channel = unsafe { Channel::new(ENDPOINT_CPTR, FRAME_VADDR as *mut u8) };
     loop {
-        core::hint::spin_loop();
+        let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
+        match grant::classify(&received) {
+            Incoming::Grant { object, ops } => serve_grant(&mut keystore, &mut backend, object, ops),
+            Incoming::ForgedGrant => {
+                let _ = grant::reply_status(status::ACCESS);
+            }
+            Incoming::Data => {
+                let mut request = [0u8; REQUEST_CAP];
+                if let Ok((op, len)) = channel.recv_request(received, &mut request) {
+                    let mut reply = [0u8; REQUEST_CAP];
+                    let (status, reply_len) =
+                        lantern_crypto::wire::handle_request(&keystore, received.badge, op, &request[..len], &mut reply);
+                    let _ = channel.reply(status, &reply[..reply_len]);
+                }
+                // `recv_request`'s `Err` path has already sent `INVALID` itself.
+            }
+        }
     }
+}
+
+/// RFC-0020's `GRANT`: mint exactly `ops` on `object` and hand the badge back. The
+/// checks that matter (the key exists, isn't destroyed, and supports `ops`) are
+/// `request_key_access`'s own.
+fn serve_grant(keystore: &mut Keystore, backend: &mut Abi, object: usize, ops: usize) {
+    let request = u16::try_from(object)
+        .ok()
+        .zip(u8::try_from(ops).ok().filter(|&bits| bits != 0).and_then(KeyOps::from_bits));
+    let Some((object, ops)) = request else {
+        let _ = grant::reply_status(status::INVALID);
+        return;
+    };
+    let granted = keystore
+        .request_key_access(backend, KeyId::from_raw(object), ops, ENDPOINT_CPTR, SCRATCH_CPTR)
+        .and_then(|_badge| keystore.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, 0)));
+    if granted.is_err() {
+        let _ = grant::reply_status(status::INVALID);
+    }
+    // `Reply` copies a transferred capability; the next `GRANT` needs this slot empty.
+    let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
 }

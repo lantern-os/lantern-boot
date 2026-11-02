@@ -430,6 +430,14 @@
   is embedded in this image, whose one 2 MiB megapage now has about 139 KiB left in
   `runtime-fs-demo`, a third tight limit alongside `MAX_FRAMES` 16/16 and root `CNODE_SLOTS`
   31/32.
+- **Both runtime demos launch through the binder (2026-11-02, [RFC-0020](../lantern-rfcs/rfcs/0020-launch-binder.md)/[ADR-0025](../lantern-rfcs/adr/0025-launch-binder.md)).**
+  A third or fourth program, `assets/launch-binder.elf`, holds the only `GRANTER_BADGE`d copy of the
+  service's endpoint; the runtime gets only the binder's. `ProgramSpec::package` became
+  `launch::map_package`, so one read-only `Frame` is mapped into both. Services take a new
+  `BINDER_LAUNCHED` `arg0` flag; the older demos keep their first-caller grant. The image now spans
+  **two kernel megapages** (`0x8040_0000` was already unused below `GENERAL_MEMORY_BASE`), and is about
+  2.1 MiB in `runtime-fs-demo`. **`scripts/binder-matrix.sh`:** 14 cases under QEMU, restoring the
+  assets afterwards. `runtime-fs-demo` now uses 20 of 24 `MAX_FRAMES` and 42 of 56 root `CNODE_SLOTS`.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS

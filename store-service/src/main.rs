@@ -27,16 +27,23 @@
 //! single VSpace (`KS_FRAME_VADDR`/`CLIENT_FRAME_VADDR`) — `Channel` has no
 //! concept of "the" frame, each instance just wraps whichever `(endpoint,
 //! frame)` pair it was constructed against.
+//!
+//! The [`grant::BINDER_LAUNCHED`] `arg0` flag drops the first-caller file grant: this
+//! instance then grants only over [RFC-0020](../../lantern-rfcs/rfcs/0020-launch-binder.md)'s
+//! `GRANT`, from the launch binder. Its own client leg to `keystore-service` is
+//! launcher-fixed infrastructure and stays as it is. In every mode, a `GRANT` from anyone
+//! else is refused `ACCESS`.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::Channel;
+use lantern_abi::frame::{status, Channel};
+use lantern_abi::grant::{self, Incoming};
 use lantern_abi::sys;
 use lantern_capabilities::Abi;
 use lantern_filesystem::cipher::ChannelCipher;
-use lantern_filesystem::{wire, FileOps, Store};
+use lantern_filesystem::{wire, FileId, FileOps, Store};
 
 lantern_abi::entry!(run);
 
@@ -70,7 +77,7 @@ const CLIENT_FRAME_VADDR: usize = 0x9001_0000;
 /// `keystore-service`'s identical constant for the general sizing rule.
 const REQUEST_CAP: usize = 256;
 
-fn run(_arg0: usize) -> ! {
+fn run(arg0: usize) -> ! {
     // Client leg: register with keystore-service, registering our own
     // reply-leg destination (broker-client's exact convention).
     let _ = sys::call_with_reply_slot(KS_ENDPOINT_CPTR, KS_DEST_CPTR, [0, 0]);
@@ -85,31 +92,64 @@ fn run(_arg0: usize) -> ! {
     let mut backend = Abi;
     // Service leg: one client Call's, registering its own reply-leg
     // destination; grant it READ|WRITE on the one file this demo creates.
-    let _ = sys::recv(CLIENT_ENDPOINT_CPTR);
-    if let Ok(()) = store
-        .request_file_access(&mut backend, file, FileOps::READ.union(FileOps::WRITE), CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR)
-        .and_then(|_badge| store.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)))
-    {
-        // SAFETY: as above, for `CLIENT_FRAME_VADDR` (the loader's *second*
-        // `map_shared_frame` call).
-        let mut client_channel = unsafe { Channel::new(CLIENT_ENDPOINT_CPTR, CLIENT_FRAME_VADDR as *mut u8) };
-        loop {
-            let Ok(received) = sys::recv(CLIENT_ENDPOINT_CPTR) else { continue };
-            let mut request = [0u8; REQUEST_CAP];
-            if let Ok((op, len)) = client_channel.recv_request(received, &mut request) {
-                // The keystore-service leg: Store's own encrypt/decrypt reach
-                // the AEAD key over real IPC, not a direct &Keystore call.
-                let mut cipher = ChannelCipher::new(&mut ks_channel);
-                let mut reply = [0u8; REQUEST_CAP];
-                let (status, reply_len) =
-                    wire::handle_request(&mut store, &mut cipher, received.badge, op, &request[..len], &mut reply);
-                let _ = client_channel.reply(status, &reply[..reply_len]);
+    if arg0 & grant::BINDER_LAUNCHED == 0 {
+        let _ = sys::recv(CLIENT_ENDPOINT_CPTR);
+        let granted = store
+            .request_file_access(&mut backend, file, FileOps::READ.union(FileOps::WRITE), CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR)
+            .and_then(|_badge| store.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)));
+        if granted.is_err() {
+            loop {
+                core::hint::spin_loop();
             }
-            // `recv_request`'s `Err` path has already sent `INVALID` itself.
         }
+        // `Reply` copies a transferred capability; a later `GRANT` needs this slot empty.
+        let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
     }
 
+    // SAFETY: as above, for `CLIENT_FRAME_VADDR` (the loader's *second*
+    // `map_shared_frame` call).
+    let mut client_channel = unsafe { Channel::new(CLIENT_ENDPOINT_CPTR, CLIENT_FRAME_VADDR as *mut u8) };
     loop {
-        core::hint::spin_loop();
+        let Ok(received) = sys::recv(CLIENT_ENDPOINT_CPTR) else { continue };
+        match grant::classify(&received) {
+            Incoming::Grant { object, ops } => serve_grant(&mut store, &mut backend, object, ops),
+            Incoming::ForgedGrant => {
+                let _ = grant::reply_status(status::ACCESS);
+            }
+            Incoming::Data => {
+                let mut request = [0u8; REQUEST_CAP];
+                if let Ok((op, len)) = client_channel.recv_request(received, &mut request) {
+                    // The keystore-service leg: Store's own encrypt/decrypt reach
+                    // the AEAD key over real IPC, not a direct &Keystore call.
+                    let mut cipher = ChannelCipher::new(&mut ks_channel);
+                    let mut reply = [0u8; REQUEST_CAP];
+                    let (status, reply_len) =
+                        wire::handle_request(&mut store, &mut cipher, received.badge, op, &request[..len], &mut reply);
+                    let _ = client_channel.reply(status, &reply[..reply_len]);
+                }
+                // `recv_request`'s `Err` path has already sent `INVALID` itself.
+            }
+        }
     }
+}
+
+/// RFC-0020's `GRANT`: mint exactly `ops` on `object` and hand the badge back. The
+/// checks that matter (the file exists and isn't destroyed) are
+/// `request_file_access`'s own.
+fn serve_grant(store: &mut Store, backend: &mut Abi, object: usize, ops: usize) {
+    let request = u16::try_from(object)
+        .ok()
+        .zip(u8::try_from(ops).ok().filter(|&bits| bits != 0).and_then(FileOps::from_bits));
+    let Some((object, ops)) = request else {
+        let _ = grant::reply_status(status::INVALID);
+        return;
+    };
+    let granted = store
+        .request_file_access(backend, FileId::from_raw(object), ops, CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR)
+        .and_then(|_badge| store.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, 0)));
+    if granted.is_err() {
+        let _ = grant::reply_status(status::INVALID);
+    }
+    // `Reply` copies a transferred capability; the next `GRANT` needs this slot empty.
+    let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
 }
