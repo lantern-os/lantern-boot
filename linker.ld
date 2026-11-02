@@ -8,8 +8,8 @@ ENTRY(_start)
 BASE_ADDRESS = 0x80200000;
 
 /* Sv39 megapage size (2 MiB) — `loader.rs` maps this whole image at that
- * granularity (one megapage, S-mode-only — every loaded program's VSpace needs
- * it mapped for the trap vector/kernel dispatch/`sret` cold-start path to keep
+ * granularity (two megapages, S-mode-only — every loaded program's VSpace needs
+ * them mapped for the trap vector/kernel dispatch/`sret` cold-start path to keep
  * working after that program's own table is active, RISC-V traps don't switch
  * page tables), a documented workaround for a QEMU environment limitation with
  * full 3-level (4 KiB) walks — see `lantern-hal`'s `riscv64_paging::map_megapage`
@@ -47,8 +47,8 @@ SECTIONS
     . += 64K; /* Phase 1: one hart, one boot-time stack — not sized for anything else. */
     PROVIDE(_stack_top = .);
 
-    ASSERT(_stack_top <= BASE_ADDRESS + MEGAPAGE_SIZE,
-           "kernel image (.text through the boot stack) overflowed past its one reserved 2 MiB megapage")
+    ASSERT(_stack_top <= BASE_ADDRESS + 2 * MEGAPAGE_SIZE,
+           "kernel image (.text through the boot stack) overflowed past its two reserved 2 MiB megapages")
 
     /DISCARD/ : {
         *(.eh_frame)
