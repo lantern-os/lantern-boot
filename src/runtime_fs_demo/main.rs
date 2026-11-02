@@ -55,7 +55,7 @@ fn panic(info: &PanicInfo) -> ! {
 /// Narrates the demo's syscalls from S-mode, same style as
 /// `../runtime_demo/main.rs`'s trap handler. `Signal` additionally prints the
 /// runtime's stage code and detail word — `a1`/`a2`, captured before dispatch,
-/// which `Signal` itself ignores (`confined-runtime/src/main.rs`'s
+/// which `Signal` itself ignores (`confined-runtime/src/lib.rs`'s
 /// "Diagnostics"): stage `0` with the runtime's heap bytes used on
 /// success, the failing step otherwise.
 #[cfg(target_arch = "riscv64")]

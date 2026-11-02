@@ -5,11 +5,12 @@
 //! `store_demo`'s three-program topology with its client swapped for a real
 //! runtime, the way `runtime_demo` did for `keystore_demo`:
 //! `../../keystore-service/` (AEAD profile) ← `../../store-service/` ←
-//! `lantern-runtime/confined-runtime`'s `lantern-confined-runtime-fs`, a
-//! confined `lantern-runtime` process hosting `confined-fs-guest` whose
-//! `filesystem` slot 0 is `IpcFilesystem` over the second shared `Frame`. The
-//! guest arrives as the signed package `assets/fs-probe.lpkg`, mapped
-//! read-only (see `runtime_demo/loader.rs`'s module doc).
+//! `lantern-runtime/confined-runtime`, a confined `lantern-runtime` process
+//! hosting `confined-fs-guest` whose `filesystem` slot 0 is `IpcFilesystem`
+//! over the second shared `Frame`. The guest arrives as the signed package
+//! `assets/fs-probe.lpkg`, mapped read-only (see `runtime_demo/loader.rs`'s
+//! module doc). It is the same runtime ELF as `runtime_demo`'s: the package's
+//! own manifest is what selects `filesystem` over `keystore`.
 //! Every guest `read`/`write` crosses three confined programs, and the
 //! store-service seals each block through its own grant on the
 //! keystore-service — a key neither the runtime nor the guest can name.
@@ -36,7 +37,7 @@ use crate::pmm;
 
 const KEYSTORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/keystore-service.elf");
 const STORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/store-service.elf");
-const CONFINED_RUNTIME_FS_ELF: &[u8] = include_bytes!("../../assets/confined-runtime-fs.elf");
+const CONFINED_RUNTIME_ELF: &[u8] = include_bytes!("../../assets/confined-runtime.elf");
 /// `confined-fs-guest`'s signed package, built by `lantern-sdk build` from
 /// `lantern-runtime/confined-fs-guest/` (see that crate's
 /// `lantern.capabilities.toml`).
@@ -140,7 +141,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             package: None,
         },
         ProgramSpec {
-            elf_bytes: CONFINED_RUNTIME_FS_ELF,
+            elf_bytes: CONFINED_RUNTIME_ELF,
             // The runtime's `arg0` is its package's exact length.
             arg0: FS_PROBE_LPKG.len(),
             grants: &[

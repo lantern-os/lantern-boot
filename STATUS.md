@@ -395,7 +395,7 @@
 - **An eighth demo, `lantern-boot-runtime-fs-demo` — RFC-0018's filesystem integration
   proof** (2026-10-12, same day). `store_demo`'s three-program topology (keystore-service
   in its AEAD profile ← store-service ← client) with the client replaced by
-  `lantern-runtime/confined-runtime`'s `lantern-confined-runtime-fs`, a confined runtime
+  `lantern-runtime/confined-runtime`, a confined runtime
   hosting `confined-fs-guest` over `IpcFilesystem`. **6/6 reproducible `SUCCESS`**; all
   seven earlier demos regression-clean. Sits at two kernel limits, documented in its
   loader: `MAX_FRAMES` exactly 16/16, and root `CNODE_SLOTS` 31/32 — the latter only
@@ -423,6 +423,13 @@
   pass. Both runtime demos give 5/5 identical `SUCCESS` across `-m 64M`–`512M`. Feeding
   `runtime-fs-demo` a tampered, foreign-signed, or truncated package makes the runtime
   signal `FAILURE` at stage 9 every time (see `lantern-runtime/STATUS.md`).
+- **Both runtime demos load the same runtime ELF (2026-11-02).**
+  `assets/confined-runtime-fs.elf` is gone: the guest package's own manifest now selects the
+  runtime's wiring (see `lantern-runtime/STATUS.md`), so the two demos differ only in their
+  services and package. Both 5/5 `SUCCESS` across `-m 64M`–`512M`. The larger ELF (1,103 KiB)
+  is embedded in this image, whose one 2 MiB megapage now has about 139 KiB left in
+  `runtime-fs-demo`, a third tight limit alongside `MAX_FRAMES` 16/16 and root `CNODE_SLOTS`
+  31/32.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
