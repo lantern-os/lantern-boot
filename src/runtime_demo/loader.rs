@@ -14,7 +14,7 @@
 //!   guest is not in the runtime's image: it arrives as the signed package
 //!   `assets/probe.lpkg`, mapped read-only at `launch::PACKAGE_VADDR`, which
 //!   the runtime verifies against its own trusted publisher key before
-//!   deserializing.
+//!   deserializing. Its manifest is what selects `keystore` as the wiring.
 //!
 //! The runtime gets more than any earlier client: a 2 MiB private heap
 //! (Wasmtime bookkeeping, the Pulley interpreter stack; ~640 KiB measured) and an
@@ -47,7 +47,7 @@ const ENDPOINT_CPTR: CPtr = 1;
 /// Matches `keystore-service`'s own `SELF_CNODE_CPTR` (see
 /// `keystore_demo/loader.rs`'s `KEYSTORE_SELF_CNODE_CPTR`).
 const KEYSTORE_SELF_CNODE_CPTR: CPtr = 0;
-/// Matches `confined-runtime/src/main.rs`'s own `SUCCESS_CPTR`/`FAILURE_CPTR`
+/// Matches `confined-runtime/src/lib.rs`'s own `SUCCESS_CPTR`/`FAILURE_CPTR`
 /// — `pub` so `main.rs`'s trap handler can narrate by comparing against them.
 pub const RUNTIME_SUCCESS_CPTR: CPtr = 3;
 pub const RUNTIME_FAILURE_CPTR: CPtr = 4;
@@ -57,7 +57,7 @@ pub const RUNTIME_FAILURE_CPTR: CPtr = 4;
 const RUNTIME_SELF_VSPACE_CPTR: CPtr = 6;
 const RUNTIME_ARENA_FRAME_CPTR_BASE: CPtr = 7;
 const RUNTIME_ARENA_MEGAPAGES: usize = 3;
-/// Matches `confined-runtime/src/main.rs`'s `HEAP_LEN` (one 2 MiB megapage).
+/// Matches `confined-runtime/src/lib.rs`'s `HEAP_LEN` (one 2 MiB megapage).
 const RUNTIME_HEAP_MEGAPAGES: usize = 1;
 
 /// Where the shared Frame is mapped in both programs' VSpaces — matches
