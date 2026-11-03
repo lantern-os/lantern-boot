@@ -70,10 +70,10 @@
 
 use lantern_hal::TrapFrame;
 use lantern_kernel::admin;
-use lantern_kernel::cap::{Capability, CPtr, ObjectType, Rights, TcbId, VSpaceId};
+use lantern_kernel::cap::{Capability, CPtr, ObjectType, Rights, TcbId, UntypedId, VSpaceId};
 use lantern_kernel::cnode;
 use lantern_kernel::frame::{self as frame_invoke, LABEL_MAP};
-use lantern_kernel::object::SavedContext;
+use lantern_kernel::object::{SavedContext, Untyped};
 use lantern_kernel::state::KernelState;
 
 use crate::elf;
@@ -169,6 +169,18 @@ pub struct ArenaGrant {
 /// `lantern-abi`, so this has to match by hand; a mismatch fails closed.
 #[allow(dead_code)]
 pub const GRANTER_BADGE: u64 = (1 << 56) - 1;
+/// `virt.flash1` (RFC-0022), and where its first megapage is mapped in `policy-store` alone. Must
+/// match `lantern-shell/policy-store/src/main.rs`'s `FLASH_VADDR`.
+#[allow(dead_code)]
+pub const POLICY_FLASH_PADDR: usize = 0x2200_0000;
+#[allow(dead_code)]
+pub const POLICY_FLASH_VADDR: usize = 0x9400_0000;
+/// `policy-store`'s capability slots (`lantern-shell/policy-store/src/main.rs`).
+#[allow(dead_code)]
+pub const POLICY_STORE_ENDPOINT_CPTR: CPtr = 1;
+/// `lantern-shell/launch-binder/src/main.rs`'s `POLICY_STORE_CPTR`.
+#[allow(dead_code)]
+pub const BINDER_POLICY_STORE_CPTR: CPtr = 8;
 /// `lantern_abi::grant::CONTROL_BADGE` (RFC-0021): what the launcher mints onto the
 /// binder-endpoint copy held by whoever may list and revoke its grants.
 #[allow(dead_code)]
@@ -633,4 +645,29 @@ pub fn map_package(
         map(state, root, frame_cptr, vspace, PACKAGE_VADDR, PERM_R | PERM_U);
     }
     delete(state, root, frame_cptr);
+}
+
+/// Maps one megapage of device memory at `paddr` read/write into `vspace` (RFC-0022). Nothing here is
+/// a general device capability: the launcher, already trusted with every physical range, names this
+/// one, and retype doesn't write to it (`admin::untyped_retype` only records the address). `paddr`
+/// must be megapage-aligned.
+#[allow(dead_code)]
+pub fn map_device_frame(state: &mut KernelState, root: TcbId, paddr: usize, vspace: CPtr, vaddr: usize, next_slot: &mut CPtr) {
+    let id = state
+        .untypeds
+        .alloc(Untyped::with_memory(1, paddr, lantern_hal::RISCV64_MEGAPAGE_SIZE))
+        .expect("untyped pool exhausted");
+    let untyped_cptr = *next_slot;
+    *next_slot += 1;
+    let cnode = state.tcbs.get(root.0 as usize).unwrap().cspace.expect("root has a CSpace");
+    *state.cnodes.get_mut(cnode.0 as usize).unwrap().slot_mut(untyped_cptr).unwrap() =
+        Capability::Untyped { id: UntypedId(id as u16), rights: Rights::ALL };
+
+    let frame_cptr = *next_slot;
+    *next_slot += 1;
+    let frame = retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr);
+    assert!(matches!(frame, Capability::Frame { .. }), "expected a Frame capability");
+    map(state, root, frame_cptr, vspace, vaddr, PERM_R | PERM_W | PERM_U);
+    delete(state, root, frame_cptr);
+    delete(state, root, untyped_cptr);
 }

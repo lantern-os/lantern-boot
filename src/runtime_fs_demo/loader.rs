@@ -29,11 +29,16 @@
 //! ([RFC-0021](../../../lantern-rfcs/rfcs/0021-grant-ledger-and-revocation.md)) and revokes the
 //! runtime's file grant midway through its run. A test script, not a user interface.
 //!
+//! `lantern-shell/policy-store/` ([RFC-0022](../../../lantern-rfcs/rfcs/0022-persistent-revocation-store.md))
+//! makes that revocation outlive a reboot, on `virt.flash1`. **This demo needs that flash attached:**
+//! `-drive if=pflash,format=raw,unit=1,file=<32 MiB image of 0xFF bytes>`. Without it, or on a second boot
+//! of the same image, the role is declined.
+//!
 //! **This is the largest demo, and what `lantern-kernel/src/limits.rs` is sized
 //! from.** Frames: the runtime's image (2) + stack (1) + heap (1) + arena (3),
 //! the shared package (1), each service's image (2) + stack (1), the binder's
-//! image (2) + stack (1) + heap (1), grant-control's image (2) + stack (1), and the
-//! two shared `Frame`s: 23. Five programs is also the most `MAX_VSPACES` allows.
+//! image (2) + stack (1) + heap (1), grant-control's image (2) + stack (1), policy-store's image (2) + stack (1) + flash (1),
+//! and the two shared `Frame`s: 27. Six programs is also the most `MAX_VSPACES` allows.
 
 use lantern_kernel::cap::{Capability, CNode, CNodeId, CPtr, ObjectType, Rights, TcbId, UntypedId};
 use lantern_kernel::object::{Tcb, Untyped};
@@ -46,6 +51,7 @@ const STORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/store-service.elf"
 const CONFINED_RUNTIME_ELF: &[u8] = include_bytes!("../../assets/confined-runtime.elf");
 const LAUNCH_BINDER_ELF: &[u8] = include_bytes!("../../assets/launch-binder.elf");
 const GRANT_CONTROL_ELF: &[u8] = include_bytes!("../../assets/grant-control.elf");
+const POLICY_STORE_ELF: &[u8] = include_bytes!("../../assets/policy-store.elf");
 /// `confined-fs-guest`'s signed package, built by `lantern-sdk build` from
 /// `lantern-runtime/confined-fs-guest/` (see that crate's
 /// `lantern.capabilities.toml`).
@@ -151,6 +157,14 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let failure_root_cptr = next_slot;
     next_slot += 1;
     launch::retype(state, root, untyped_cptr, ObjectType::Notification, failure_root_cptr);
+    // RFC-0022: only the binder can reach the policy store.
+    let policy_endpoint_root_cptr = next_slot;
+    next_slot += 1;
+    launch::retype(state, root, untyped_cptr, ObjectType::Endpoint, policy_endpoint_root_cptr);
+    let policy_client_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, policy_endpoint_root_cptr, policy_client_root_cptr, Rights::WRITE, 0);
+
     let revoke_request_root_cptr = next_slot;
     next_slot += 1;
     launch::retype(state, root, untyped_cptr, ObjectType::Notification, revoke_request_root_cptr);
@@ -186,6 +200,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
             arg0: FS_PROBE_LPKG.len(),
             grants: &[
                 (binder_endpoint_root_cptr, launch::BINDER_ENDPOINT_CPTR),
+                (policy_client_root_cptr, launch::BINDER_POLICY_STORE_CPTR),
                 (granter_root_cptr, launch::BINDER_STORE_GRANTER_CPTR),
             ],
             self_cnode_dest: None,
@@ -225,8 +240,28 @@ pub unsafe fn run(mem_end: usize) -> ! {
             heap_megapages: 0,
             arena: None,
         },
+        ProgramSpec {
+            elf_bytes: POLICY_STORE_ELF,
+            arg0: 0,
+            grants: &[
+                (policy_endpoint_root_cptr, launch::POLICY_STORE_ENDPOINT_CPTR),
+                (failure_root_cptr, RUNTIME_FAILURE_CPTR),
+            ],
+            self_cnode_dest: None,
+            heap_megapages: 0,
+            arena: None,
+        },
     ];
-    let [keystore, store, binder, runtime, control] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
+    let [keystore, store, binder, runtime, control, policy_store] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
+
+    launch::map_device_frame(
+        state,
+        root,
+        launch::POLICY_FLASH_PADDR,
+        policy_store.vspace_cptr,
+        launch::POLICY_FLASH_VADDR,
+        &mut next_slot,
+    );
 
     launch::map_package(state, root, untyped_cptr, FS_PROBE_LPKG, &[binder.vspace_cptr, runtime.vspace_cptr], &mut next_slot);
 
@@ -256,6 +291,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
     state.make_ready(store.tcb);
     state.make_ready(binder.tcb);
     state.make_ready(control.tcb);
+    state.make_ready(policy_store.tcb);
 
     crate::println!("runtime-fs-demo: entering the confined runtime (loaded ELF, own VSpace, U-mode)");
     // SAFETY: first and only call on this hart; all three programs' contexts

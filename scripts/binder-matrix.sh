@@ -12,6 +12,9 @@
 # Every `SUCCESS` here also ran RFC-0021's revocation: the runtime's own badge refused the control
 # ops, a request left open across the revocation, `grant-control`'s empty, out-of-range and repeated
 # requests, and a second `probe` that had to report the refusal. See `grant-control/src/main.rs`.
+#
+# Each case gets a freshly erased flash image, unless it sets KEEP to continue from the last case's
+# (RFC-0022). A second boot is simply a second run on the same image.
 set -u
 cd "$(dirname "$0")/.."
 SDK="${LANTERN_SDK:-../lantern-sdk}"
@@ -21,6 +24,10 @@ mkdir -p "$WORK/keep"
 cp assets/probe.lpkg assets/fs-probe.lpkg "$WORK/keep/"
 cleanup() { cp "$WORK/keep/"*.lpkg assets/; rm -rf "$WORK"; }
 trap cleanup EXIT
+# `virt.flash1` must be exactly 32 MiB. Erased flash reads as all ones.
+ERASED="$WORK/erased.img"
+IMAGE="$WORK/flash.img"
+head -c 33554432 /dev/zero | tr '\0' '\377' >"$ERASED"
 
 (cd "$SDK" && cargo build -q --example resign) || exit 2
 RESIGN="$SDK/target/debug/examples/resign"
@@ -30,7 +37,9 @@ RESIGN="$SDK/target/debug/examples/resign"
 # QEMU never exits by itself, since the demos park after signalling.
 run_demo() {
     local out="$WORK/qemu.out"
-    qemu-system-riscv64 -machine virt -bios default -nographic -m 128M -kernel "$1" </dev/null >"$out" 2>&1 &
+    local drive=(-drive "if=pflash,format=raw,unit=1,file=$IMAGE")
+    [ -n "${NO_FLASH:-}" ] && drive=()
+    qemu-system-riscv64 -machine virt -bios default -nographic -m 128M "${drive[@]}" -kernel "$1" </dev/null >"$out" 2>&1 &
     local pid=$!
     for _ in $(seq 1 900); do
         grep -aq "Signal'd" "$out" && break
@@ -48,6 +57,7 @@ failures=0
 # check <label> <demo> <asset> <expected> <seed|keep|asis> [manifest text]
 check() {
     local label=$1 demo=$2 asset=$3 want=$4 seed=$5 manifest=${6-}
+    [ -n "${KEEP:-}" ] || cp "$ERASED" "$IMAGE"
     if [ "$seed" != asis ]; then
         printf '%s' "$manifest" >"$WORK/manifest.toml"
         "$RESIGN" "$WORK/keep/$asset" "$WORK/manifest.toml" "assets/$asset" "$seed" || exit 2
@@ -97,5 +107,31 @@ check 'filesystem: app not in policy'              $F $L FAILURE:8 4c "$(app oth
 $(file scratch '"read", "write"')"
 check 'filesystem: keystore manifest, no granter'  $F $L FAILURE:7 4c "$(app confined-probe)
 $(key probe-signing '"sign"')"
+
+# RFC-0022. The header is 32 bytes, so the first record's key starts at 32 and its check at 48.
+patch_image() { printf "$2" | dd of="$IMAGE" bs=1 seek="$1" conv=notrunc status=none; }
+
+check 'store: first boot revokes'                  $P $K SUCCESS asis
+KEEP=1 check 'store: second boot is declined'      $P $K FAILURE:8 asis
+KEEP=1 check 'store: another role is unaffected'   $F $L SUCCESS asis
+KEEP=1 check 'store: and is declined next boot'    $F $L FAILURE:8 asis
+KEEP=1 check 'store: the first stays declined'     $P $K FAILURE:8 asis
+
+check 'store: first boot, to corrupt'              $P $K SUCCESS asis
+patch_image 32 '\x5a\xa5\x5a\xa5'
+KEEP=1 check 'store: corrupt record declines it'   $P $K FAILURE:8 asis
+KEEP=1 check 'store: corrupt declines all roles'   $F $L FAILURE:8 asis
+
+check 'store: first boot, to tear'                 $P $K SUCCESS asis
+patch_image 48 '\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff'
+KEEP=1 check 'store: a torn record was never made' $P $K SUCCESS asis
+KEEP=1 check 'store: the log recovered after it'   $P $K FAILURE:8 asis
+
+NO_FLASH=1 check 'store: no flash declines everything' $P $K FAILURE:8 asis
+
+# The known limit, tested so that it stays visible: nothing here resists writing the flash from outside.
+check 'store: first boot, to erase'                $P $K SUCCESS asis
+cp "$ERASED" "$IMAGE"
+KEEP=1 check 'store: KNOWN LIMIT, erasing restores' $P $K SUCCESS asis
 
 [ "$failures" -eq 0 ] && echo 'all matched' || { echo "$failures mismatched"; exit 1; }
