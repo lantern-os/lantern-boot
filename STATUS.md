@@ -446,6 +446,14 @@
   23 of 24 Frames, 6 of 6 CNodes, 5 of 5 VSpaces, 53 of 56 root slots, so **another program needs the
   limits raised**. RFC-0021's estimate of 2 Frames for `grant-control` was low: its 8 bytes of `.data` cost a
   second megapage. Binder-path ELFs are now built with `--remap-path-prefix`, so they embed no local paths.
+- **A revocation survives a reboot (2026-11-03, [RFC-0022](../lantern-rfcs/rfcs/0022-persistent-revocation-store.md)/[ADR-0027](../lantern-rfcs/adr/0027-persistent-revocation-store.md)).** Both runtime demos load `policy-store` and map one megapage of
+  `virt.flash1` into it with `launch::map_device_frame`, using no new kernel mechanism. **They now need the flash attached:**
+  `-drive if=pflash,format=raw,unit=1,file=<32 MiB image of 0xFF bytes>`. Without it, every grant is declined.
+  `binder-matrix.sh` now has 28 cases, booting one image twice. Mutation-tested: a binder skipping `IS_REVOKED` and a store
+  not writing `RECORD` each let a revoked role back on the second boot, and a binder not recording fails `grant-control`'s
+  durable check at stage 12. Measured in `runtime-fs-demo` at launch: 27 of 28 Frames, 7 of 7 CNodes, 6 of 6 VSpaces, 64 of
+  72 root slots, so **another program needs the limits raised**. RFC-0022's estimate of 64 root slots left no headroom, so
+  `CNODE_SLOTS` went to 72.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
