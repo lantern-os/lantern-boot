@@ -246,6 +246,23 @@ pub fn retype(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, object_t
     state.cnodes.get(cspace.0 as usize).unwrap().get(dest).unwrap()
 }
 
+/// [`retype`], for a Frame of ordinary memory, cleared before anything can see it. The kernel's retype
+/// only records an address, and it can't do this itself: general memory isn't mapped once paging is on,
+/// and a device Frame mustn't be written to at all ([`map_device_frame`]). RAM's power-on contents are
+/// otherwise visible to the program, and a program's BSS relies on this.
+/// `scripts/dirty-ram.sh` checks it, since QEMU's own RAM starts zeroed.
+pub fn retype_frame(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, object_type: ObjectType, dest: CPtr) -> Capability {
+    let capability = retype(state, root, untyped_cptr, object_type, dest);
+    let Capability::Frame { id, .. } = capability else {
+        panic!("expected a Frame capability");
+    };
+    let frame = state.frames.get(id.0 as usize).unwrap();
+    // SAFETY: a Frame just bump-allocated from the launcher's general-memory Untyped, so nothing else
+    // refers to it. The launcher reaches physical memory directly, as `load`'s segment copy does.
+    unsafe { core::ptr::write_bytes(frame.paddr as *mut u8, 0, frame.size.bytes()) };
+    capability
+}
+
 /// Mints an attenuated copy of `root`'s own capability at `src` (in its own
 /// CSpace) into `dest` (also its own CSpace), with `rights`/`badge` — a real
 /// `CNodeInvoke::Mint`, via [`SELF_CNODE_CPTR`], same trust tier as [`retype`].
@@ -426,7 +443,7 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
         let frame_cptr = *next_slot;
         *next_slot += 1;
         let Capability::Frame { id: frame_id, .. } =
-            retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr)
+            retype_frame(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr)
         else {
             panic!("expected a Frame capability");
         };
@@ -456,7 +473,7 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
             // Copy only the file bytes that actually land within this step's
             // byte range; anything outside `[file_start, file_end)` (BSS, or
             // simply a step this segment's `filesz` doesn't reach) is left as
-            // the Frame's own zeroed-on-retype contents.
+            // the zeroes [`retype_frame`] left there.
             let step_end = v + mega;
             let copy_start = v.max(file_start);
             let copy_end = step_end.min(file_end);
@@ -464,8 +481,8 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
                 let within_frame = copy_start - v;
                 let file_offset = ph.offset as usize + (copy_start - file_start);
                 // SAFETY: `paddr` names a Frame retyped in pass 2 above,
-                // exclusively owned by this launcher and zeroed on retype
-                // (`Untyped::bump`'s "no reclaim" guarantee) — identity-mapped
+                // exclusively owned by this launcher, and cleared by
+                // [`retype_frame`] — identity-mapped
                 // in *this* (the launcher's own) address space, since it came
                 // from the shared kernel megapage's identity-mapped range.
                 // Two segments sharing a megapage write disjoint byte ranges
@@ -483,7 +500,7 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
 
     let stack_cptr = *next_slot;
     *next_slot += 1;
-    let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, stack_cptr) else {
+    let Capability::Frame { .. } = retype_frame(state, root, untyped_cptr, ObjectType::FrameMega, stack_cptr) else {
         panic!("expected a Frame capability");
     };
     map(state, root, stack_cptr, vspace_cptr, STACK_VADDR, PERM_R | PERM_W | PERM_U);
@@ -492,7 +509,7 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
     for i in 0..spec.heap_megapages {
         let heap_cptr = *next_slot;
         *next_slot += 1;
-        let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, heap_cptr) else {
+        let Capability::Frame { .. } = retype_frame(state, root, untyped_cptr, ObjectType::FrameMega, heap_cptr) else {
             panic!("expected a Frame capability");
         };
         map(state, root, heap_cptr, vspace_cptr, HEAP_VADDR + i * mega, PERM_R | PERM_W | PERM_U);
@@ -528,7 +545,7 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
         // above, just sourced from `vspace_cptr` instead of `cnode_cptr`.
         copy_cross(state, root, SELF_CNODE_CPTR, vspace_cptr, cnode_cptr, arena.self_vspace_dest);
         for i in 0..arena.megapages {
-            let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, scratch_cptr) else {
+            let Capability::Frame { .. } = retype_frame(state, root, untyped_cptr, ObjectType::FrameMega, scratch_cptr) else {
                 panic!("expected a Frame capability");
             };
             // Deliberately no `map` call here — granted unmapped; the
@@ -607,7 +624,7 @@ pub fn map_shared_frame(
 ) {
     let frame_cptr = *next_slot;
     *next_slot += 1;
-    let Capability::Frame { .. } = retype(state, root, untyped_cptr, ObjectType::FrameSmall, frame_cptr) else {
+    let Capability::Frame { .. } = retype_frame(state, root, untyped_cptr, ObjectType::FrameSmall, frame_cptr) else {
         panic!("expected a Frame capability");
     };
     map(state, root, frame_cptr, vspace_a, vaddr_a, PERM_R | PERM_W | PERM_U);
@@ -633,7 +650,7 @@ pub fn map_package(
 ) {
     assert!(package.len() <= lantern_hal::RISCV64_MEGAPAGE_SIZE, "a package must fit one megapage");
     let frame_cptr = *next_slot;
-    let Capability::Frame { id: frame_id, .. } = retype(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr) else {
+    let Capability::Frame { id: frame_id, .. } = retype_frame(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr) else {
         panic!("expected a Frame capability");
     };
     let paddr = state.frames.get(frame_id.0 as usize).unwrap().paddr;
@@ -649,7 +666,8 @@ pub fn map_package(
 
 /// Maps one megapage of device memory at `paddr` read/write into `vspace` (RFC-0022). Nothing here is
 /// a general device capability: the launcher, already trusted with every physical range, names this
-/// one, and retype doesn't write to it (`admin::untyped_retype` only records the address). `paddr`
+/// one, and retype doesn't write to it (`admin::untyped_retype` only records the address), which is
+/// why this alone uses plain [`retype`] rather than [`retype_frame`]. `paddr`
 /// must be megapage-aligned.
 #[allow(dead_code)]
 pub fn map_device_frame(state: &mut KernelState, root: TcbId, paddr: usize, vspace: CPtr, vaddr: usize, next_slot: &mut CPtr) {
