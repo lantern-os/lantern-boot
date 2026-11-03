@@ -8,6 +8,10 @@
 # Expected values are `SUCCESS`, or `FAILURE:<stage>[:<detail>]`, with stages from
 # lantern-runtime/confined-runtime/src/lib.rs. A declined grant has no stage of its own: the
 # guest sees `none` and reports an error, which is stage 8 (Verdict).
+#
+# Every `SUCCESS` here also ran RFC-0021's revocation: the runtime's own badge refused the control
+# ops, a request left open across the revocation, `grant-control`'s empty, out-of-range and repeated
+# requests, and a second `probe` that had to report the refusal. See `grant-control/src/main.rs`.
 set -u
 cd "$(dirname "$0")/.."
 SDK="${LANTERN_SDK:-../lantern-sdk}"

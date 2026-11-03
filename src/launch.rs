@@ -169,6 +169,25 @@ pub struct ArenaGrant {
 /// `lantern-abi`, so this has to match by hand; a mismatch fails closed.
 #[allow(dead_code)]
 pub const GRANTER_BADGE: u64 = (1 << 56) - 1;
+/// `lantern_abi::grant::CONTROL_BADGE` (RFC-0021): what the launcher mints onto the
+/// binder-endpoint copy held by whoever may list and revoke its grants.
+#[allow(dead_code)]
+pub const CONTROL_BADGE: u64 = (1 << 56) - 1;
+/// Must match `lantern-shell/grant-control/src/main.rs`'s own constants.
+#[allow(dead_code)]
+pub const GRANT_CONTROL_CONTROL_CPTR: CPtr = 1;
+#[allow(dead_code)]
+pub const GRANT_CONTROL_STRANGER_CPTR: CPtr = 2;
+#[allow(dead_code)]
+pub const GRANT_CONTROL_REQUEST_CPTR: CPtr = 5;
+#[allow(dead_code)]
+pub const GRANT_CONTROL_DONE_CPTR: CPtr = 6;
+/// `lantern_crypto::KeyOps::SIGN` and `lantern_filesystem::FileOps::{READ, WRITE}`'s bits. This
+/// crate depends on neither.
+#[allow(dead_code)]
+pub const KEY_OP_SIGN: usize = 1 << 2;
+#[allow(dead_code)]
+pub const FILE_OPS_READ_WRITE: usize = 0b11;
 /// `lantern_abi::grant::BINDER_LAUNCHED`: an `arg0` flag telling a service it
 /// grants only over `GRANT`, never to its first caller.
 #[allow(dead_code)]

@@ -23,7 +23,7 @@
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::{status, Channel};
+use lantern_abi::frame::{RefuseInterlopers, status, Channel};
 use lantern_abi::sys;
 
 lantern_abi::entry!(run);
@@ -48,12 +48,13 @@ fn run(_arg0: usize) -> ! {
 
     let received = sys::recv(ENDPOINT_CPTR).unwrap();
     let mut request = [0u8; REQUEST_CAP];
-    if let Ok((_op, len)) = channel.recv_request(received, &mut request) {
+    let badge = received.badge;
+    if let Ok((_op, len)) = channel.recv_request(received, &mut request, &mut RefuseInterlopers) {
         let mut reply = [0u8; REQUEST_CAP];
         for i in 0..len {
             reply[i] = !request[i];
         }
-        let _ = channel.reply(status::OK, &reply[..len]);
+        let _ = channel.reply(status::OK, &reply[..len], badge, &mut RefuseInterlopers);
     }
     // `recv_request`'s `Err` path has already sent `INVALID` itself.
 
