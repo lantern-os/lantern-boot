@@ -38,9 +38,9 @@
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::{status, Channel};
+use lantern_abi::frame::{self, status, Channel, Interloper};
 use lantern_abi::grant::{self, Incoming};
-use lantern_abi::sys;
+use lantern_abi::sys::{self, Received};
 use lantern_capabilities::Abi;
 use lantern_filesystem::cipher::ChannelCipher;
 use lantern_filesystem::{wire, FileId, FileOps, Store};
@@ -112,24 +112,50 @@ fn run(arg0: usize) -> ! {
     loop {
         let Ok(received) = sys::recv(CLIENT_ENDPOINT_CPTR) else { continue };
         match grant::classify(&received) {
-            Incoming::Grant { object, ops } => serve_grant(&mut store, &mut backend, object, ops),
-            Incoming::ForgedGrant => {
-                let _ = grant::reply_status(status::ACCESS);
-            }
             Incoming::Data => {
                 let mut request = [0u8; REQUEST_CAP];
-                if let Ok((op, len)) = client_channel.recv_request(received, &mut request) {
+                let mut others = Others { store: &mut store, backend: &mut backend };
+                if let Ok((op, len)) = client_channel.recv_request(received, &mut request, &mut others) {
                     // The keystore-service leg: Store's own encrypt/decrypt reach
                     // the AEAD key over real IPC, not a direct &Keystore call.
                     let mut cipher = ChannelCipher::new(&mut ks_channel);
                     let mut reply = [0u8; REQUEST_CAP];
                     let (status, reply_len) =
                         wire::handle_request(&mut store, &mut cipher, received.badge, op, &request[..len], &mut reply);
-                    let _ = client_channel.reply(status, &reply[..reply_len]);
+                    let mut others = Others { store: &mut store, backend: &mut backend };
+                    let _ = client_channel.reply(status, &reply[..reply_len], received.badge, &mut others);
                 }
                 // `recv_request`'s `Err` path has already sent `INVALID` itself.
             }
+            _ => Others { store: &mut store, backend: &mut backend }.serve(received),
         }
+    }
+}
+
+/// Everything that isn't the data client: served the same way whether this program is idle or
+/// waiting on a client's next chunk (RFC-0021). All of it stays off the shared `Frame`.
+struct Others<'a> {
+    store: &'a mut Store,
+    backend: &'a mut Abi,
+}
+
+impl Interloper for Others<'_> {
+    fn serve(&mut self, received: Received) {
+        match grant::classify(&received) {
+            Incoming::Grant { object, ops } => serve_grant(self.store, self.backend, object, ops),
+            Incoming::Revoke { badge } => {
+                let status = if self.store.revoke_access(badge).is_ok() { status::OK } else { status::INVALID };
+                let _ = grant::reply_status(status);
+            }
+            Incoming::ForgedGrant => {
+                let _ = grant::reply_status(status::ACCESS);
+            }
+            Incoming::Data => frame::reply_busy(),
+        }
+    }
+
+    fn still_allowed(&self, badge: u64) -> bool {
+        !self.store.is_revoked(badge)
     }
 }
 
@@ -146,7 +172,7 @@ fn serve_grant(store: &mut Store, backend: &mut Abi, object: usize, ops: usize) 
     };
     let granted = store
         .request_file_access(backend, FileId::from_raw(object), ops, CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR)
-        .and_then(|_badge| store.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, 0)));
+        .and_then(|badge| store.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, badge as usize)));
     if granted.is_err() {
         let _ = grant::reply_status(status::INVALID);
     }

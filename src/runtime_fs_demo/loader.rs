@@ -25,10 +25,15 @@
 //! store-service's own grant from keystore-service is launcher-fixed infrastructure
 //! rather than an app's request, and it stays a first-caller grant.
 //!
+//! `lantern-shell/grant-control/` holds the binder's control capability
+//! ([RFC-0021](../../../lantern-rfcs/rfcs/0021-grant-ledger-and-revocation.md)) and revokes the
+//! runtime's file grant midway through its run. A test script, not a user interface.
+//!
 //! **This is the largest demo, and what `lantern-kernel/src/limits.rs` is sized
 //! from.** Frames: the runtime's image (2) + stack (1) + heap (1) + arena (3),
 //! the shared package (1), each service's image (2) + stack (1), the binder's
-//! image (2) + stack (1) + heap (1), and the two shared `Frame`s: 20.
+//! image (2) + stack (1) + heap (1), grant-control's image (2) + stack (1), and the
+//! two shared `Frame`s: 23. Five programs is also the most `MAX_VSPACES` allows.
 
 use lantern_kernel::cap::{Capability, CNode, CNodeId, CPtr, ObjectType, Rights, TcbId, UntypedId};
 use lantern_kernel::object::{Tcb, Untyped};
@@ -40,6 +45,7 @@ const KEYSTORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/keystore-servic
 const STORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/store-service.elf");
 const CONFINED_RUNTIME_ELF: &[u8] = include_bytes!("../../assets/confined-runtime.elf");
 const LAUNCH_BINDER_ELF: &[u8] = include_bytes!("../../assets/launch-binder.elf");
+const GRANT_CONTROL_ELF: &[u8] = include_bytes!("../../assets/grant-control.elf");
 /// `confined-fs-guest`'s signed package, built by `lantern-sdk build` from
 /// `lantern-runtime/confined-fs-guest/` (see that crate's
 /// `lantern.capabilities.toml`).
@@ -71,6 +77,14 @@ const RUNTIME_HEAP_MEGAPAGES: usize = 1;
 /// `keystore-service`'s `PROFILE_AEAD`: the store's sealing key.
 const ARG0_KEYSTORE_AEAD: usize = 0;
 const ARG0_STORE: usize = 1;
+
+/// Matches `confined-runtime/src/lib.rs`'s `REVOKE_REQUEST_CPTR`/`REVOKE_DONE_CPTR`.
+const RUNTIME_REVOKE_REQUEST_CPTR: CPtr = 10;
+const RUNTIME_REVOKE_DONE_CPTR: CPtr = 11;
+
+/// What `grant-control` expects to find: `lantern_abi::grant::INTERFACE_FILESYSTEM`, with
+/// `FileOps::READ | FileOps::WRITE`'s bits above it.
+const ARG0_GRANT_CONTROL: usize = 2 | (launch::FILE_OPS_READ_WRITE << 8);
 
 /// Sets up the loader's own privileged root identity, retypes both shared
 /// endpoints and the runtime's two proof notifications, loads all three
@@ -123,6 +137,13 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let binder_client_root_cptr = next_slot;
     next_slot += 1;
     launch::mint(state, root, binder_endpoint_root_cptr, binder_client_root_cptr, Rights::WRITE, 0);
+    // RFC-0021: the same endpoint under another badge is what lists and revokes.
+    let binder_control_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, binder_endpoint_root_cptr, binder_control_root_cptr, Rights::WRITE, launch::CONTROL_BADGE);
+    let stranger_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, ss_endpoint_root_cptr, stranger_root_cptr, Rights::WRITE, 0);
 
     let success_root_cptr = next_slot;
     next_slot += 1;
@@ -130,6 +151,12 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let failure_root_cptr = next_slot;
     next_slot += 1;
     launch::retype(state, root, untyped_cptr, ObjectType::Notification, failure_root_cptr);
+    let revoke_request_root_cptr = next_slot;
+    next_slot += 1;
+    launch::retype(state, root, untyped_cptr, ObjectType::Notification, revoke_request_root_cptr);
+    let revoke_done_root_cptr = next_slot;
+    next_slot += 1;
+    launch::retype(state, root, untyped_cptr, ObjectType::Notification, revoke_done_root_cptr);
 
     let specs = [
         ProgramSpec {
@@ -173,6 +200,8 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 (binder_client_root_cptr, RUNTIME_ENDPOINT_CPTR),
                 (success_root_cptr, RUNTIME_SUCCESS_CPTR),
                 (failure_root_cptr, RUNTIME_FAILURE_CPTR),
+                (revoke_request_root_cptr, RUNTIME_REVOKE_REQUEST_CPTR),
+                (revoke_done_root_cptr, RUNTIME_REVOKE_DONE_CPTR),
             ],
             self_cnode_dest: None,
             heap_megapages: RUNTIME_HEAP_MEGAPAGES,
@@ -182,8 +211,22 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 frame_dest_base: RUNTIME_ARENA_FRAME_CPTR_BASE,
             }),
         },
+        ProgramSpec {
+            elf_bytes: GRANT_CONTROL_ELF,
+            arg0: ARG0_GRANT_CONTROL,
+            grants: &[
+                (binder_control_root_cptr, launch::GRANT_CONTROL_CONTROL_CPTR),
+                (stranger_root_cptr, launch::GRANT_CONTROL_STRANGER_CPTR),
+                (failure_root_cptr, RUNTIME_FAILURE_CPTR),
+                (revoke_request_root_cptr, launch::GRANT_CONTROL_REQUEST_CPTR),
+                (revoke_done_root_cptr, launch::GRANT_CONTROL_DONE_CPTR),
+            ],
+            self_cnode_dest: None,
+            heap_megapages: 0,
+            arena: None,
+        },
     ];
-    let [keystore, store, binder, runtime] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
+    let [keystore, store, binder, runtime, control] = launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
 
     launch::map_package(state, root, untyped_cptr, FS_PROBE_LPKG, &[binder.vspace_cptr, runtime.vspace_cptr], &mut next_slot);
 
@@ -212,6 +255,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
     state.make_ready(keystore.tcb);
     state.make_ready(store.tcb);
     state.make_ready(binder.tcb);
+    state.make_ready(control.tcb);
 
     crate::println!("runtime-fs-demo: entering the confined runtime (loaded ELF, own VSpace, U-mode)");
     // SAFETY: first and only call on this hart; all three programs' contexts

@@ -78,12 +78,13 @@ fn runtime_fs_demo_trap_handler(frame: &mut TrapFrame) {
             let which = match incoming[0] {
                 cptr if cptr == loader::RUNTIME_SUCCESS_CPTR => "SUCCESS",
                 cptr if cptr == loader::RUNTIME_FAILURE_CPTR => "FAILURE",
-                _ => "unknown",
+                // RFC-0021's demo-only pair between the runtime and grant-control.
+                _ => return,
             };
             println!("runtime-fs-demo: runtime Signal'd {which} -- ok={ok} stage={} detail={}", incoming[1], incoming[2]);
             if which == "SUCCESS" {
                 println!(
-                    "runtime-fs-demo: the real proof: a confined Wasm guest wrote and read back a file served by a confined store-service, sealed through a confined keystore-service; an oversized write was refused without changing it, and an ungranted slot read back none"
+                    "runtime-fs-demo: the real proof: a confined Wasm guest wrote and read back a file served by a confined store-service, sealed through a confined keystore-service; an oversized write was refused without changing it, and an ungranted slot read back none; once grant-control revoked the grant, the guest's next read was refused"
                 );
             }
         }

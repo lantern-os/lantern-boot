@@ -45,9 +45,9 @@
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::{status, Channel};
+use lantern_abi::frame::{self, status, Channel, Interloper};
 use lantern_abi::grant::{self, Incoming};
-use lantern_abi::sys;
+use lantern_abi::sys::{self, Received};
 use lantern_capabilities::Abi;
 use lantern_crypto::{KeyId, KeyOps, Keystore};
 
@@ -121,21 +121,47 @@ fn run(arg0: usize) -> ! {
     loop {
         let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
         match grant::classify(&received) {
-            Incoming::Grant { object, ops } => serve_grant(&mut keystore, &mut backend, object, ops),
-            Incoming::ForgedGrant => {
-                let _ = grant::reply_status(status::ACCESS);
-            }
             Incoming::Data => {
                 let mut request = [0u8; REQUEST_CAP];
-                if let Ok((op, len)) = channel.recv_request(received, &mut request) {
+                let mut others = Others { keystore: &mut keystore, backend: &mut backend };
+                if let Ok((op, len)) = channel.recv_request(received, &mut request, &mut others) {
                     let mut reply = [0u8; REQUEST_CAP];
                     let (status, reply_len) =
                         lantern_crypto::wire::handle_request(&keystore, received.badge, op, &request[..len], &mut reply);
-                    let _ = channel.reply(status, &reply[..reply_len]);
+                    let mut others = Others { keystore: &mut keystore, backend: &mut backend };
+                    let _ = channel.reply(status, &reply[..reply_len], received.badge, &mut others);
                 }
                 // `recv_request`'s `Err` path has already sent `INVALID` itself.
             }
+            _ => Others { keystore: &mut keystore, backend: &mut backend }.serve(received),
         }
+    }
+}
+
+/// Everything that isn't the data client: served the same way whether this program is idle or
+/// waiting on a client's next chunk (RFC-0021). All of it stays off the shared `Frame`.
+struct Others<'a> {
+    keystore: &'a mut Keystore,
+    backend: &'a mut Abi,
+}
+
+impl Interloper for Others<'_> {
+    fn serve(&mut self, received: Received) {
+        match grant::classify(&received) {
+            Incoming::Grant { object, ops } => serve_grant(self.keystore, self.backend, object, ops),
+            Incoming::Revoke { badge } => {
+                let status = if self.keystore.revoke_access(badge).is_ok() { status::OK } else { status::INVALID };
+                let _ = grant::reply_status(status);
+            }
+            Incoming::ForgedGrant => {
+                let _ = grant::reply_status(status::ACCESS);
+            }
+            Incoming::Data => frame::reply_busy(),
+        }
+    }
+
+    fn still_allowed(&self, badge: u64) -> bool {
+        !self.keystore.is_revoked(badge)
     }
 }
 
@@ -152,7 +178,7 @@ fn serve_grant(keystore: &mut Keystore, backend: &mut Abi, object: usize, ops: u
     };
     let granted = keystore
         .request_key_access(backend, KeyId::from_raw(object), ops, ENDPOINT_CPTR, SCRATCH_CPTR)
-        .and_then(|_badge| keystore.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, 0)));
+        .and_then(|badge| keystore.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, badge as usize)));
     if granted.is_err() {
         let _ = grant::reply_status(status::INVALID);
     }

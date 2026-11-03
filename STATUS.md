@@ -438,6 +438,14 @@
   **two kernel megapages** (`0x8040_0000` was already unused below `GENERAL_MEMORY_BASE`), and is about
   2.1 MiB in `runtime-fs-demo`. **`scripts/binder-matrix.sh`:** 14 cases under QEMU, restoring the
   assets afterwards. `runtime-fs-demo` now uses 20 of 24 `MAX_FRAMES` and 42 of 56 root `CNODE_SLOTS`.
+- **Both runtime demos revoke a grant midway through (2026-11-02, [RFC-0021](../lantern-rfcs/rfcs/0021-grant-ledger-and-revocation.md)/[ADR-0026](../lantern-rfcs/adr/0026-grant-ledger-and-revocation.md)).** `grant-control`, a scripted test
+  program from `lantern-shell`, holds the binder's control capability. `REVOKE` is served while the
+  service is waiting on the client's next chunk. Mutation-tested: a service that answers `REVOKE` without
+  revoking fails at stage 11, `Channel` taking a mid-exchange message from anyone fails at stage 12, and
+  a binder serving `REVOKE` to the runtime's badge fails at stage 1. Measured in `runtime-fs-demo` at launch:
+  23 of 24 Frames, 6 of 6 CNodes, 5 of 5 VSpaces, 53 of 56 root slots, so **another program needs the
+  limits raised**. RFC-0021's estimate of 2 Frames for `grant-control` was low: its 8 bytes of `.data` cost a
+  second megapage. Binder-path ELFs are now built with `--remap-path-prefix`, so they embed no local paths.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
