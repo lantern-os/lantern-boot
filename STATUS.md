@@ -454,6 +454,10 @@
   durable check at stage 12. Measured in `runtime-fs-demo` at launch: 27 of 28 Frames, 7 of 7 CNodes, 6 of 6 VSpaces, 64 of
   72 root slots, so **another program needs the limits raised**. RFC-0022's estimate of 64 root slots left no headroom, so
   `CNODE_SLOTS` went to 72.
+- **Frames are now really cleared (2026-11-03).** This file and `launch.rs` said Frames were zeroed on retype, but nothing did
+  it: QEMU's RAM just happens to start zeroed. On non-zero RAM, `wasm-probe`, `runtime` and `runtime-fs` all hung. Every Frame of
+  ordinary memory now goes through `launch::retype_frame`, and a device Frame deliberately doesn't. `scripts/dirty-ram.sh` runs
+  the 7 demos with a pass signal on patterned RAM. It covers Frames only, not other memory the launcher assumes, and it is QEMU, not real hardware.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
