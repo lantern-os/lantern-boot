@@ -466,7 +466,8 @@
   ready) — deferred: Phase 1 links `lantern-kernel` directly as a library rather than
   loading/verifying a separate signed image, since there's no separate image and no exit
   criterion needing that trust chain yet.
-- Decide the minimum required hardware root of trust (unchanged open question).
+- Decide the minimum required hardware root of trust. Phase 4, on
+  [RFC-0023](../lantern-rfcs/rfcs/0023-hardware-key-custody-in-phase-4.md)'s checklist.
 - Root-cause the `wfi` crash properly, once there's a reason to need real `wfi`/interrupt
   handling (i.e. once `lantern-hal` gains timer/interrupt-controller support).
 - ~~Real physical memory discovery (from the DTB `boot_main` already receives)~~ —
