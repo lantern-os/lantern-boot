@@ -3,7 +3,8 @@
 # hostile manifest, and checks what the confined runtime signals. Exits nonzero on any
 # mismatch, restoring the assets either way.
 #
-#   LANTERN_SDK   path to a lantern-sdk checkout (default: ../lantern-sdk)
+#   LANTERN_SDK     path to a lantern-sdk checkout (default: ../lantern-sdk)
+#   LANTERN_SHELL   path to a lantern-shell checkout, for `audit-dump` (default: ../lantern-shell)
 #
 # Expected values are `SUCCESS`, or `FAILURE:<stage>[:<detail>]`, with stages from
 # lantern-runtime/confined-runtime/src/lib.rs. A declined grant has no stage of its own: the
@@ -18,6 +19,7 @@
 set -u
 cd "$(dirname "$0")/.."
 SDK="${LANTERN_SDK:-../lantern-sdk}"
+SHELL_REPO="${LANTERN_SHELL:-../lantern-shell}"
 TARGET=target/riscv64gc-unknown-none-elf/release
 WORK=$(mktemp -d)
 mkdir -p "$WORK/keep"
@@ -32,6 +34,8 @@ head -c 33554432 /dev/zero | tr '\0' '\377' >"$ERASED"
 (cd "$SDK" && cargo build -q --example resign) || exit 2
 RESIGN="$SDK/target/debug/examples/resign"
 [ -x "$RESIGN" ] || { echo "no resign binary at $RESIGN" >&2; exit 2; }
+(cd "$SHELL_REPO/policy-store" && cargo build -q --example audit-dump --target x86_64-unknown-linux-gnu) || exit 2
+DUMP="$SHELL_REPO/policy-store/target/x86_64-unknown-linux-gnu/debug/examples/audit-dump"
 
 # Prints the demo's `Signal'd` result: `SUCCESS`, `FAILURE:<stage>:<detail>`, or NO-SIGNAL.
 # QEMU never exits by itself, since the demos park after signalling.
@@ -108,6 +112,19 @@ $(file scratch '"read", "write"')"
 check 'filesystem: keystore manifest, no granter'  $F $L FAILURE:7 4c "$(app confined-probe)
 $(key probe-signing '"sign"')"
 
+# audit <label> <events>: the audit log's events, as EVENT or EVENT:REASON, must be exactly <events>,
+# with a verifying chain. `CORRUPT` expects the dump to refuse the log.
+audit() {
+    local label=$1 want=$2 got
+    got=$("$DUMP" "$IMAGE" | awk '/^record/ { printf "%s%s%s", sep, $3, ($4 == "-" ? "" : ":" $4); sep = " " } /^CORRUPT/ { printf "CORRUPT" }')
+    if [ "$got" = "$want" ]; then
+        printf 'ok    %-44s %s\n' "$label" "$got"
+    else
+        printf 'FAIL  %-44s want %s, got %s\n' "$label" "$want" "$got"
+        failures=$((failures + 1))
+    fi
+}
+
 # RFC-0022. The header is 32 bytes, so the first record's key starts at 32 and its check at 48.
 patch_image() { printf "$2" | dd of="$IMAGE" bs=1 seek="$1" conv=notrunc status=none; }
 
@@ -133,5 +150,45 @@ NO_FLASH=1 check 'store: no flash declines everything' $P $K FAILURE:8 asis
 check 'store: first boot, to erase'                $P $K SUCCESS asis
 cp "$ERASED" "$IMAGE"
 KEEP=1 check 'store: KNOWN LIMIT, erasing restores' $P $K SUCCESS asis
+audit 'audit: erasing left one boot'               'BOOT GRANTING DECLINED:NOT_DECLARED REVOKING REVOKING'
+
+# RFC-0024. `grant-control` verifies the chain and this boot's records inside every runtime `SUCCESS` above;
+# these check the log across boots, from outside. The audit log's header is at 0x40000, then 64-byte records.
+check 'audit: first boot'                          $P $K SUCCESS asis
+audit 'audit: one boot is recorded'                'BOOT GRANTING DECLINED:NOT_DECLARED REVOKING REVOKING'
+KEEP=1 check 'audit: second boot'                  $P $K FAILURE:8 asis
+audit 'audit: the log continues across boots'      'BOOT GRANTING DECLINED:NOT_DECLARED REVOKING REVOKING BOOT DECLINED:REVOKED'
+
+check 'audit: app not in policy'                   $P $K FAILURE:8 4c "$(app other-app)
+$(key probe-signing '"sign"')"
+audit 'audit: records why'                         'BOOT DECLINED:NOT_IN_POLICY'
+check 'audit: no granter for the interface'        $F $L FAILURE:7 4c "$(app confined-probe)
+$(key probe-signing '"sign"')"
+audit 'audit: a refused grant is recorded'         'BOOT GRANTING GRANT_FAILED'
+
+check 'audit: first boot, to edit'                 $P $K SUCCESS asis
+patch_image $((0x40044)) '\x5a\xa5\x5a\xa5'
+audit 'audit: an edited record reads as corrupt'   CORRUPT
+KEEP=1 check 'audit: corrupt log declines grants'  $F $L FAILURE:8 asis
+
+check 'audit: first boot, to tear'                 $P $K SUCCESS asis
+patch_image $((0x40040 + 4 * 64 + 60)) '\xff\xff\xff\xff'
+KEEP=1 check 'audit: a torn record recovers'       $F $L SUCCESS asis
+audit 'audit: and the chain continues'             'BOOT GRANTING DECLINED:NOT_DECLARED REVOKING BOOT GRANTING DECLINED:NOT_DECLARED REVOKING REVOKING'
+
+# The known limit: without a key held in hardware, the whole chain can be rewritten consistently.
+check 'audit: first boot, to rewrite'              $P $K SUCCESS asis
+KEPT=$("$DUMP" "$IMAGE" | sed -n 's/^chain ok count=\([0-9]*\) head=\([0-9a-f]*\)$/\1 \2/p')
+"$DUMP" "$IMAGE" --forge-drop 1 "$WORK/forged.img" >/dev/null
+cp "$WORK/forged.img" "$IMAGE"
+audit 'audit: KNOWN LIMIT, a rewrite verifies'     'BOOT DECLINED:NOT_DECLARED REVOKING REVOKING'
+KEEP=1 check 'audit: and the store accepts it'     $F $L SUCCESS asis
+# shellcheck disable=SC2086
+if "$DUMP" "$IMAGE" --kept $KEPT >/dev/null; then
+    printf 'FAIL  %-44s a kept head missed the rewrite\n' 'audit: a kept head reveals it'
+    failures=$((failures + 1))
+else
+    printf 'ok    %-44s %s\n' 'audit: a kept head reveals it' MISMATCH
+fi
 
 [ "$failures" -eq 0 ] && echo 'all matched' || { echo "$failures mismatched"; exit 1; }

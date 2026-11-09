@@ -458,6 +458,12 @@
   it: QEMU's RAM just happens to start zeroed. On non-zero RAM, `wasm-probe`, `runtime` and `runtime-fs` all hung. Every Frame of
   ordinary memory now goes through `launch::retype_frame`, and a device Frame deliberately doesn't. `scripts/dirty-ram.sh` runs
   the 7 demos with a pass signal on patterned RAM. It covers Frames only, not other memory the launcher assumes, and it is QEMU, not real hardware.
+- **Every grant is recorded first (2026-11-05, [RFC-0024](../lantern-rfcs/rfcs/0024-audit-log.md)/[ADR-0029](../lantern-rfcs/adr/0029-audit-log.md)).** `grant-control` gets a read-only audit capability and checks the chain
+  and this boot's records in both runtime demos. `binder-matrix.sh` now has 47 cases, reading the log across boots with
+  `lantern-shell/policy-store`'s `audit-dump` (`LANTERN_SHELL`, default `../lantern-shell`). They include an edited record, a torn
+  record, a refused grant, and a consistent rewrite that a kept head catches. Mutation-tested: a binder granting without recording
+  first, and a store letting the reader append, each fail at stage 12. A binder ignoring the log's refusal fails the corrupt-log case.
+  Measured in `runtime-fs-demo`: 65 of 72 root slots, everything else unchanged.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
