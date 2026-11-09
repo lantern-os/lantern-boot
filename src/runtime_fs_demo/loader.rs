@@ -164,6 +164,10 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let policy_client_root_cptr = next_slot;
     next_slot += 1;
     launch::mint(state, root, policy_endpoint_root_cptr, policy_client_root_cptr, Rights::WRITE, 0);
+    // RFC-0024: and grant-control reads the audit log through its own read-only copy.
+    let policy_reader_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, policy_endpoint_root_cptr, policy_reader_root_cptr, Rights::WRITE, launch::READER_BADGE);
 
     let revoke_request_root_cptr = next_slot;
     next_slot += 1;
@@ -235,6 +239,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 (failure_root_cptr, RUNTIME_FAILURE_CPTR),
                 (revoke_request_root_cptr, launch::GRANT_CONTROL_REQUEST_CPTR),
                 (revoke_done_root_cptr, launch::GRANT_CONTROL_DONE_CPTR),
+                (policy_reader_root_cptr, launch::GRANT_CONTROL_READER_CPTR),
             ],
             self_cnode_dest: None,
             heap_megapages: 0,

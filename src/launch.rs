@@ -194,6 +194,11 @@ pub const GRANT_CONTROL_STRANGER_CPTR: CPtr = 2;
 pub const GRANT_CONTROL_REQUEST_CPTR: CPtr = 5;
 #[allow(dead_code)]
 pub const GRANT_CONTROL_DONE_CPTR: CPtr = 6;
+#[allow(dead_code)]
+pub const GRANT_CONTROL_READER_CPTR: CPtr = 7;
+/// `lantern_abi::policy::READER_BADGE` (RFC-0024): the audit log's read-only capability.
+#[allow(dead_code)]
+pub const READER_BADGE: u64 = (1 << 56) - 1;
 /// `lantern_crypto::KeyOps::SIGN` and `lantern_filesystem::FileOps::{READ, WRITE}`'s bits. This
 /// crate depends on neither.
 #[allow(dead_code)]
