@@ -40,6 +40,11 @@
 //! over [RFC-0020](../../lantern-rfcs/rfcs/0020-launch-binder.md)'s `GRANT`, from
 //! the launch binder, and never to its first caller. In every mode, a `GRANT`
 //! from anyone else is refused `ACCESS`.
+//!
+//! The [`grant::AUDITED`] flag ([RFC-0025](../../lantern-rfcs/rfcs/0025-audit-log-service-operations.md))
+//! makes this instance record every use of a grant in the policy store's audit log, through
+//! [`policy::audited`], before the operation runs, and its own first-caller grant before delivering
+//! it. An operation the log refuses doesn't run, and the client gets `FAILED`.
 
 #![no_std]
 #![no_main]
@@ -47,6 +52,7 @@
 
 use lantern_abi::frame::{self, status, Channel, Interloper};
 use lantern_abi::grant::{self, Incoming};
+use lantern_abi::policy::{self, event, AuditEntry};
 use lantern_abi::sys::{self, Received};
 use lantern_capabilities::Abi;
 use lantern_crypto::{KeyId, KeyOps, Keystore};
@@ -62,6 +68,8 @@ const SELF_CNODE_CPTR: usize = 0;
 const ENDPOINT_CPTR: usize = 1;
 /// Scratch slot the minted, badged copy lands in before `Reply` transfers it.
 const SCRATCH_CPTR: usize = 3;
+/// The policy store's endpoint under `KEYSTORE_WRITER_BADGE`, when launched [`grant::AUDITED`].
+const AUDIT_CPTR: usize = 5;
 /// Where the loader mapped this program's half of the shared `Frame` — must
 /// match `keystore-client`'s own constant.
 const FRAME_VADDR: usize = 0x9000_0000;
@@ -79,6 +87,8 @@ const DEMO_SIGNING_SEED: [u8; 32] = [0x24; 32];
 /// `arg0` values — see the module doc. Must match each loader's own constant.
 const PROFILE_AEAD: usize = 0;
 const PROFILE_SIGNING: usize = 1;
+/// The profile is `arg0`'s low byte; every flag (`grant::BINDER_LAUNCHED`, `grant::AUDITED`) is above it.
+const PROFILE_MASK: usize = 0xff;
 
 /// Large enough for this demo's small ENCRYPT/DECRYPT payloads; a real
 /// service sizes this per its own worst-case reassembled argument
@@ -87,25 +97,39 @@ const REQUEST_CAP: usize = 256;
 
 fn run(arg0: usize) -> ! {
     let mut keystore = Keystore::new(SELF_CNODE_CPTR);
-    let (key, ops) = match arg0 & !grant::BINDER_LAUNCHED {
+    let (key, ops) = match arg0 & PROFILE_MASK {
         PROFILE_SIGNING => (keystore.generate_signing_key(DEMO_SIGNING_SEED), KeyOps::SIGN),
         PROFILE_AEAD => (keystore.generate_aead_key(DEMO_AEAD_SEED), KeyOps::ENCRYPT.union(KeyOps::DECRYPT)),
         _ => panic!("keystore-service: unknown arg0 profile"),
     };
     let key = key.unwrap();
     let mut backend = Abi;
+    let audited = arg0 & grant::AUDITED != 0;
 
     // Phase 1: one client Call's, registering its own reply-leg destination;
     // grant it `ops` on the one demo key.
     if arg0 & grant::BINDER_LAUNCHED == 0 {
         let _ = sys::recv(ENDPOINT_CPTR);
-        let granted = keystore
-            .request_key_access(&mut backend, key, ops, ENDPOINT_CPTR, SCRATCH_CPTR)
-            .and_then(|_badge| keystore.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)));
-        if granted.is_err() {
-            loop {
-                core::hint::spin_loop();
+        // Recorded after minting, since the badge is the record, and before delivering: an unrecorded
+        // grant never reaches its holder. It is withdrawn instead, and the caller told, and this service
+        // goes on serving, refusing everything, rather than stopping every program with it.
+        let minted = keystore.request_key_access(&mut backend, key, ops, ENDPOINT_CPTR, SCRATCH_CPTR).ok();
+        let recorded = minted.filter(|&badge| {
+            let entry = AuditEntry {
+                event: event::SERVICE_GRANTED,
+                object: key.raw(),
+                ops: ops.bits(),
+                subject: [badge, 0],
+                ..AuditEntry::default()
+            };
+            !audited || policy::append(AUDIT_CPTR, &entry) == Ok(status::OK)
+        });
+        let delivered = recorded.is_some_and(|_| keystore.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)).is_ok());
+        if !delivered {
+            if let Some(badge) = minted {
+                let _ = keystore.revoke_access(badge);
             }
+            let _ = grant::reply_status(status::FAILED);
         }
         // `Reply` copies a transferred capability; a later `GRANT` needs this slot empty.
         let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
@@ -126,8 +150,21 @@ fn run(arg0: usize) -> ! {
                 let mut others = Others { keystore: &mut keystore, backend: &mut backend };
                 if let Ok((op, len)) = channel.recv_request(received, &mut request, &mut others) {
                     let mut reply = [0u8; REQUEST_CAP];
-                    let (status, reply_len) =
-                        lantern_crypto::wire::handle_request(&keystore, received.badge, op, &request[..len], &mut reply);
+                    let mut handle =
+                        || lantern_crypto::wire::handle_request(&keystore, received.badge, op, &request[..len], &mut reply);
+                    // A badge this keystore never minted names no grant, and `handle_request` refuses it.
+                    let (status, reply_len) = match keystore.key_for_badge(received.badge) {
+                        Some(key) if audited => {
+                            let using = AuditEntry {
+                                object: key.raw(),
+                                ops: op_bit(op),
+                                subject: [received.badge, len as u64],
+                                ..AuditEntry::default()
+                            };
+                            policy::audited(AUDIT_CPTR, &using, handle).unwrap_or((status::FAILED, 0))
+                        }
+                        _ => handle(),
+                    };
                     let mut others = Others { keystore: &mut keystore, backend: &mut backend };
                     let _ = channel.reply(status, &reply[..reply_len], received.badge, &mut others);
                 }
@@ -162,6 +199,17 @@ impl Interloper for Others<'_> {
 
     fn still_allowed(&self, badge: u64) -> bool {
         !self.keystore.is_revoked(badge)
+    }
+}
+
+/// The [`KeyOps`] bit a wire op uses, which is what the audit log records. 0 for an op that doesn't exist,
+/// which `handle_request` refuses as `INVALID`, and the log then shows as `USE_FAILED`.
+fn op_bit(op: u16) -> u8 {
+    match op {
+        lantern_crypto::wire::OP_SIGN => KeyOps::SIGN.bits(),
+        lantern_crypto::wire::OP_ENCRYPT => KeyOps::ENCRYPT.bits(),
+        lantern_crypto::wire::OP_DECRYPT => KeyOps::DECRYPT.bits(),
+        _ => 0,
     }
 }
 

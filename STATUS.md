@@ -464,6 +464,14 @@
   record, a refused grant, and a consistent rewrite that a kept head catches. Mutation-tested: a binder granting without recording
   first, and a store letting the reader append, each fail at stage 12. A binder ignoring the log's refusal fails the corrupt-log case.
   Measured in `runtime-fs-demo`: 65 of 72 root slots, everything else unchanged.
+- **Every use of a grant is recorded first (2026-11-10, [RFC-0025](../lantern-rfcs/rfcs/0025-audit-log-service-operations.md)/[ADR-0030](../lantern-rfcs/adr/0030-audit-log-service-operations.md)).** Both runtime demos launch `keystore-service` and
+  `store-service` with `launch::AUDITED` and a writer capability each, at `SERVICE_AUDIT_CPTR`. The pre-binder demos run them
+  unaudited. `keystore-service` takes its profile from `arg0`'s low byte, so a new flag can't change it. A service that can't
+  record its own first-caller grant now withdraws it and keeps serving, where it used to spin, which with no preemption would
+  stop every program. `binder-matrix.sh` now has 62 cases: each demo's exact sequence of uses, the quota (the `audit-quota-test`
+  feature lowers it to 1), a boot across a full ring, a power cut mid-erase both ways, and a head kept from before a retirement.
+  The torn-record case now tears the true last record. Mutation-tested: a service acting without `USING`, and a store trusting a
+  writer's interface, each fail at stage 12. Measured in `runtime-fs-demo`: 67 of 72 root slots, everything else unchanged.
 
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
