@@ -164,6 +164,10 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let policy_reader_root_cptr = next_slot;
     next_slot += 1;
     launch::mint(state, root, policy_endpoint_root_cptr, policy_reader_root_cptr, Rights::WRITE, launch::READER_BADGE);
+    // RFC-0025: each service records every use of a grant, under its own writer badge.
+    let keystore_writer_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, policy_endpoint_root_cptr, keystore_writer_root_cptr, Rights::WRITE, launch::KEYSTORE_WRITER_BADGE);
 
     let revoke_request_root_cptr = next_slot;
     next_slot += 1;
@@ -175,10 +179,10 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let specs = [
         ProgramSpec {
             elf_bytes: KEYSTORE_SERVICE_ELF,
-            arg0: ARG0_KEYSTORE_SIGNING | launch::BINDER_LAUNCHED,
+            arg0: ARG0_KEYSTORE_SIGNING | launch::BINDER_LAUNCHED | launch::AUDITED,
             // Rights::ALL, as in keystore_demo: the service mints each
             // attenuated, badged copy from this.
-            grants: &[(endpoint_root_cptr, ENDPOINT_CPTR)],
+            grants: &[(endpoint_root_cptr, ENDPOINT_CPTR), (keystore_writer_root_cptr, launch::SERVICE_AUDIT_CPTR)],
             self_cnode_dest: Some(KEYSTORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
@@ -232,7 +236,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
         },
         ProgramSpec {
             elf_bytes: POLICY_STORE_ELF,
-            arg0: 0,
+            arg0: launch::POLICY_STORE_QUOTA,
             grants: &[
                 (policy_endpoint_root_cptr, launch::POLICY_STORE_ENDPOINT_CPTR),
                 (failure_root_cptr, RUNTIME_FAILURE_CPTR),

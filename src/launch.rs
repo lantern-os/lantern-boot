@@ -199,6 +199,22 @@ pub const GRANT_CONTROL_READER_CPTR: CPtr = 7;
 /// `lantern_abi::policy::READER_BADGE` (RFC-0024): the audit log's read-only capability.
 #[allow(dead_code)]
 pub const READER_BADGE: u64 = (1 << 56) - 1;
+/// `lantern_abi::policy::{KEYSTORE,STORE}_WRITER_BADGE` (RFC-0025): each service's append-only capability to
+/// the audit log, limited by the store to records of use, under that service's own interface.
+#[allow(dead_code)]
+pub const KEYSTORE_WRITER_BADGE: u64 = READER_BADGE - 1;
+#[allow(dead_code)]
+pub const STORE_WRITER_BADGE: u64 = READER_BADGE - 2;
+/// Where an audited service finds that capability: `keystore-service`'s and `store-service`'s `AUDIT_CPTR`.
+#[allow(dead_code)]
+pub const SERVICE_AUDIT_CPTR: CPtr = 5;
+/// `lantern_abi::grant::AUDITED`: an `arg0` flag telling a service to record every use of a grant first.
+#[allow(dead_code)]
+pub const AUDITED: usize = 1 << 9;
+/// The policy store's `arg0`: its per-grant quota of operation records, where 0 means
+/// `lantern_abi::policy::USE_QUOTA`. Only `binder-matrix.sh` lowers it, through the `audit-quota-test` feature.
+#[allow(dead_code)]
+pub const POLICY_STORE_QUOTA: usize = if cfg!(feature = "audit-quota-test") { 1 } else { 0 };
 /// `lantern_crypto::KeyOps::SIGN` and `lantern_filesystem::FileOps::{READ, WRITE}`'s bits. This
 /// crate depends on neither.
 #[allow(dead_code)]

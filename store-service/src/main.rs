@@ -33,6 +33,12 @@
 //! `GRANT`, from the launch binder. Its own client leg to `keystore-service` is
 //! launcher-fixed infrastructure and stays as it is. In every mode, a `GRANT` from anyone
 //! else is refused `ACCESS`.
+//!
+//! The [`grant::AUDITED`] flag ([RFC-0025](../../lantern-rfcs/rfcs/0025-audit-log-service-operations.md))
+//! makes this instance record every use of a file grant in the policy store's audit log, through
+//! [`policy::audited`], before it runs, and its own first-caller grant before delivering it. Each
+//! `WRITE` and `READ` then reaches `keystore-service`, which records its own `ENCRYPT` and `DECRYPT`
+//! under this store's badge there.
 
 #![no_std]
 #![no_main]
@@ -40,6 +46,7 @@
 
 use lantern_abi::frame::{self, status, Channel, Interloper};
 use lantern_abi::grant::{self, Incoming};
+use lantern_abi::policy::{self, event, AuditEntry};
 use lantern_abi::sys::{self, Received};
 use lantern_capabilities::Abi;
 use lantern_filesystem::cipher::ChannelCipher;
@@ -64,6 +71,8 @@ const CLIENT_ENDPOINT_CPTR: usize = 3;
 /// Scratch slot the minted, badged file-access copy lands in before `Reply`
 /// transfers it to `store-client`.
 const SCRATCH_CPTR: usize = 4;
+/// The policy store's endpoint under `STORE_WRITER_BADGE`, when launched [`grant::AUDITED`].
+const AUDIT_CPTR: usize = 5;
 /// Where the loader mapped this program's half of the `keystore-service`
 /// shared `Frame` — must match `keystore-service`'s own `FRAME_VADDR`.
 const KS_FRAME_VADDR: usize = 0x9000_0000;
@@ -90,17 +99,32 @@ fn run(arg0: usize) -> ! {
     let file = store.create().expect("fresh Store always has room for its first file");
 
     let mut backend = Abi;
+    let audited = arg0 & grant::AUDITED != 0;
     // Service leg: one client Call's, registering its own reply-leg
     // destination; grant it READ|WRITE on the one file this demo creates.
     if arg0 & grant::BINDER_LAUNCHED == 0 {
         let _ = sys::recv(CLIENT_ENDPOINT_CPTR);
-        let granted = store
-            .request_file_access(&mut backend, file, FileOps::READ.union(FileOps::WRITE), CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR)
-            .and_then(|_badge| store.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)));
-        if granted.is_err() {
-            loop {
-                core::hint::spin_loop();
+        let ops = FileOps::READ.union(FileOps::WRITE);
+        // Recorded after minting, since the badge is the record, and before delivering: an unrecorded
+        // grant never reaches its holder. It is withdrawn instead, and the caller told, and this service
+        // goes on serving, refusing everything, rather than stopping every program with it.
+        let minted = store.request_file_access(&mut backend, file, ops, CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR).ok();
+        let recorded = minted.filter(|&badge| {
+            let entry = AuditEntry {
+                event: event::SERVICE_GRANTED,
+                object: file.raw(),
+                ops: ops.bits(),
+                subject: [badge, 0],
+                ..AuditEntry::default()
+            };
+            !audited || policy::append(AUDIT_CPTR, &entry) == Ok(status::OK)
+        });
+        let delivered = recorded.is_some_and(|_| store.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)).is_ok());
+        if !delivered {
+            if let Some(badge) = minted {
+                let _ = store.revoke_access(badge);
             }
+            let _ = grant::reply_status(status::FAILED);
         }
         // `Reply` copies a transferred capability; a later `GRANT` needs this slot empty.
         let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
@@ -120,8 +144,22 @@ fn run(arg0: usize) -> ! {
                     // the AEAD key over real IPC, not a direct &Keystore call.
                     let mut cipher = ChannelCipher::new(&mut ks_channel);
                     let mut reply = [0u8; REQUEST_CAP];
-                    let (status, reply_len) =
-                        wire::handle_request(&mut store, &mut cipher, received.badge, op, &request[..len], &mut reply);
+                    // A badge this store never minted names no grant, and `handle_request` refuses it.
+                    let granted_file = store.file_for_badge(received.badge);
+                    let mut handle =
+                        || wire::handle_request(&mut store, &mut cipher, received.badge, op, &request[..len], &mut reply);
+                    let (status, reply_len) = match granted_file {
+                        Some(file) if audited => {
+                            let using = AuditEntry {
+                                object: file.raw(),
+                                ops: op_bit(op),
+                                subject: [received.badge, len as u64],
+                                ..AuditEntry::default()
+                            };
+                            policy::audited(AUDIT_CPTR, &using, handle).unwrap_or((status::FAILED, 0))
+                        }
+                        _ => handle(),
+                    };
                     let mut others = Others { store: &mut store, backend: &mut backend };
                     let _ = client_channel.reply(status, &reply[..reply_len], received.badge, &mut others);
                 }
@@ -156,6 +194,16 @@ impl Interloper for Others<'_> {
 
     fn still_allowed(&self, badge: u64) -> bool {
         !self.store.is_revoked(badge)
+    }
+}
+
+/// The [`FileOps`] bit a wire op uses, which is what the audit log records. 0 for an op that doesn't exist,
+/// which `handle_request` refuses as `INVALID`, and the log then shows as `USE_FAILED`.
+fn op_bit(op: u16) -> u8 {
+    match op {
+        wire::OP_READ => FileOps::READ.bits(),
+        wire::OP_WRITE => FileOps::WRITE.bits(),
+        _ => 0,
     }
 }
 

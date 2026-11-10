@@ -168,6 +168,13 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let policy_reader_root_cptr = next_slot;
     next_slot += 1;
     launch::mint(state, root, policy_endpoint_root_cptr, policy_reader_root_cptr, Rights::WRITE, launch::READER_BADGE);
+    // RFC-0025: each service records every use of a grant, under its own writer badge.
+    let keystore_writer_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, policy_endpoint_root_cptr, keystore_writer_root_cptr, Rights::WRITE, launch::KEYSTORE_WRITER_BADGE);
+    let store_writer_root_cptr = next_slot;
+    next_slot += 1;
+    launch::mint(state, root, policy_endpoint_root_cptr, store_writer_root_cptr, Rights::WRITE, launch::STORE_WRITER_BADGE);
 
     let revoke_request_root_cptr = next_slot;
     next_slot += 1;
@@ -179,21 +186,25 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let specs = [
         ProgramSpec {
             elf_bytes: KEYSTORE_SERVICE_ELF,
-            arg0: ARG0_KEYSTORE_AEAD,
-            grants: &[(ks_endpoint_root_cptr, KS_ENDPOINT_CPTR)],
+            arg0: ARG0_KEYSTORE_AEAD | launch::AUDITED,
+            grants: &[(ks_endpoint_root_cptr, KS_ENDPOINT_CPTR), (keystore_writer_root_cptr, launch::SERVICE_AUDIT_CPTR)],
             self_cnode_dest: Some(KEYSTORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
         },
         ProgramSpec {
             elf_bytes: STORE_SERVICE_ELF,
-            arg0: ARG0_STORE | launch::BINDER_LAUNCHED,
+            arg0: ARG0_STORE | launch::BINDER_LAUNCHED | launch::AUDITED,
             // store-service's own retained authority is its endpoint to
             // the runtime (STORE_SERVICE_OWN_ENDPOINT_CPTR, its own
             // Broker::mint source — keystore-service's identical convention);
             // its endpoint to keystore-service is just an ordinary granted
             // capability, never minted from.
-            grants: &[(ks_endpoint_root_cptr, KS_ENDPOINT_CPTR), (ss_endpoint_root_cptr, STORE_SERVICE_OWN_ENDPOINT_CPTR)],
+            grants: &[
+                (ks_endpoint_root_cptr, KS_ENDPOINT_CPTR),
+                (ss_endpoint_root_cptr, STORE_SERVICE_OWN_ENDPOINT_CPTR),
+                (store_writer_root_cptr, launch::SERVICE_AUDIT_CPTR),
+            ],
             self_cnode_dest: Some(STORE_SELF_CNODE_CPTR),
             heap_megapages: 0,
             arena: None,
@@ -247,7 +258,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
         },
         ProgramSpec {
             elf_bytes: POLICY_STORE_ELF,
-            arg0: 0,
+            arg0: launch::POLICY_STORE_QUOTA,
             grants: &[
                 (policy_endpoint_root_cptr, launch::POLICY_STORE_ENDPOINT_CPTR),
                 (failure_root_cptr, RUNTIME_FAILURE_CPTR),

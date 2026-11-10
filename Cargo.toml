@@ -67,6 +67,11 @@ path = "src/runtime_fs_demo/main.rs"
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
 lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }
 
+[features]
+# `binder-matrix.sh` only: lowers the policy store's per-grant quota of operation records to 1, so the quota
+# case runs in seconds (RFC-0025). It can only lower it.
+audit-quota-test = []
+
 [profile.dev]
 panic = "abort"
 
