@@ -1,0 +1,21 @@
+[package]
+name = "lantern-spinner"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0027's adversary: a confined riscv64 program that, launched with arg0 0, spins forever without a system call, so only preemption lets anything else run; with arg0 1, it waits forever instead, so every thread is blocked and the kernel must idle. Loaded by lantern-boot's irq demo (src/irq_demo/)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-spinner"
+path = "src/main.rs"
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
