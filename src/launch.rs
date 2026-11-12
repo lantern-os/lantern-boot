@@ -225,6 +225,18 @@ pub const FILE_OPS_READ_WRITE: usize = 0b11;
 /// grants only over `GRANT`, never to its first caller.
 #[allow(dead_code)]
 pub const BINDER_LAUNCHED: usize = 1 << 8;
+/// `lantern_abi::grant::WITH_CONSENT` (RFC-0026): an `arg0` flag for the binder and the runtime in the interactive
+/// system. A person decides each grant, at a console only the shell reaches.
+#[allow(dead_code)]
+pub const WITH_CONSENT: usize = 1 << 40;
+/// With consent, the binder's slots for the shell's notification (badged `ASK`) and its own answer notification, and
+/// where the consent `Frame` sits in the binder and the shell. Must match `launch-binder` and `shell`.
+#[allow(dead_code)]
+pub const BINDER_SHELL_ASK_CPTR: CPtr = 9;
+#[allow(dead_code)]
+pub const BINDER_ANSWER_CPTR: CPtr = 10;
+#[allow(dead_code)]
+pub const CONSENT_VADDR: usize = 0x9000_0000;
 /// The launch binder's capability slots (`lantern-shell/launch-binder/src/main.rs`).
 #[allow(dead_code)]
 pub const BINDER_ENDPOINT_CPTR: CPtr = 1;
@@ -336,6 +348,8 @@ pub fn delete(state: &mut KernelState, root: TcbId, slot: CPtr) {
 const KERNEL_MEGAPAGE_BASE: usize = 0x8020_0000;
 const KERNEL_MEGAPAGE_2_BASE: usize = 0x8040_0000;
 const UART_MEGAPAGE_BASE: usize = 0x1000_0000;
+/// QEMU `virt`'s PLIC: 4 MiB from here, S-mode-only, as `lantern_hal`'s `riscv64` interrupt path expects (RFC-0027).
+const PLIC_MEGAPAGE_BASE: usize = 0x0c00_0000;
 
 /// Maps both kernel megapages and the UART megapage into `vspace_id`'s root
 /// table, S-mode-only (no `USER` flag) — **not** through `FrameInvoke::Map`:
@@ -364,6 +378,9 @@ pub fn map_kernel_shared(state: &mut KernelState, vspace_id: VSpaceId) {
         (KERNEL_MEGAPAGE_BASE, KERNEL_MEGAPAGE_BASE, kernel_flags),
         (KERNEL_MEGAPAGE_2_BASE, KERNEL_MEGAPAGE_2_BASE, kernel_flags),
         (UART_MEGAPAGE_BASE, UART_MEGAPAGE_BASE, mmio_flags),
+        // RFC-0027: the PLIC's priorities and enables, then its threshold and claim, for the kernel's interrupt path.
+        (PLIC_MEGAPAGE_BASE, PLIC_MEGAPAGE_BASE, mmio_flags),
+        (PLIC_MEGAPAGE_BASE + lantern_hal::RISCV64_MEGAPAGE_SIZE, PLIC_MEGAPAGE_BASE + lantern_hal::RISCV64_MEGAPAGE_SIZE, mmio_flags),
     ] {
         // SAFETY: `vspace_root` is this VSpace's own freshly built, exclusively
         // owned root table; `vaddr`/`paddr` are megapage-aligned machine
@@ -710,3 +727,38 @@ pub fn map_device_frame(state: &mut KernelState, root: TcbId, paddr: usize, vspa
     delete(state, root, frame_cptr);
     delete(state, root, untyped_cptr);
 }
+
+/// [`map_device_frame`], for one 4 KiB device page: a driver gets exactly its own registers. The UART's megapage also
+/// holds the virtio devices, so mapping it whole would hand those over too
+/// ([RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)). Never cleared, as a device Frame
+/// mustn't be written to by anyone but its driver.
+#[allow(dead_code)]
+pub fn map_small_device_frame(state: &mut KernelState, root: TcbId, paddr: usize, vspace: CPtr, vaddr: usize, next_slot: &mut CPtr) {
+    let id = state
+        .untypeds
+        .alloc(Untyped::with_memory(1, paddr, lantern_hal::RISCV64_PAGE_SIZE))
+        .expect("untyped pool exhausted");
+    let untyped_cptr = *next_slot;
+    *next_slot += 1;
+    let cnode = state.tcbs.get(root.0 as usize).unwrap().cspace.expect("root has a CSpace");
+    *state.cnodes.get_mut(cnode.0 as usize).unwrap().slot_mut(untyped_cptr).unwrap() =
+        Capability::Untyped { id: UntypedId(id as u16), rights: Rights::ALL };
+
+    let frame_cptr = *next_slot;
+    *next_slot += 1;
+    let frame = retype(state, root, untyped_cptr, ObjectType::FrameSmall, frame_cptr);
+    assert!(matches!(frame, Capability::Frame { .. }), "expected a Frame capability");
+    map(state, root, frame_cptr, vspace, vaddr, PERM_R | PERM_W | PERM_U);
+    delete(state, root, frame_cptr);
+    delete(state, root, untyped_cptr);
+}
+
+/// Puts an `IrqHandler` for `line` in the launcher's slot `dest`, to grant like any other capability. Only boot code
+/// creates handlers (RFC-0027): there's no `IrqControl` capability yet.
+#[allow(dead_code)]
+pub fn irq_handler(state: &mut KernelState, root: TcbId, line: u16, dest: CPtr) {
+    let cap = lantern_kernel::irq::create(state, line).expect("one handler per line, and room in the pool");
+    let cnode = state.tcbs.get(root.0 as usize).unwrap().cspace.expect("root has a CSpace");
+    *state.cnodes.get_mut(cnode.0 as usize).unwrap().slot_mut(dest).unwrap() = cap;
+}
+

@@ -473,6 +473,22 @@
   The torn-record case now tears the true last record. Mutation-tested: a service acting without `USING`, and a store trusting a
   writer's interface, each fail at stage 12. Measured in `runtime-fs-demo`: 67 of 72 root slots, everything else unchanged.
 
+- **Interrupts, preemption and idle, in every demo (2026-11-11, [RFC-0027](../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)/[ADR-0031](../lantern-rfcs/adr/0031-interrupt-delivery-timer-and-idle.md)).** `launch::map_kernel_shared` maps the PLIC's two
+  megapages S-mode-only. `enter_first_thread` turns interrupts and the 10 ms timer on, so every demo now runs preemptively;
+  all of them, `dirty-ram.sh` and `binder-matrix.sh` pass unchanged. A new ninth image, **`lantern-boot-irq-demo`**: a confined
+  `uart-driver` holds only the UART's 4 KiB page (new `launch::map_small_device_frame`: the UART's megapage also holds virtio),
+  an `IrqHandler` for line 10 (`launch::irq_handler`) and a notification, and echoes what's typed. `spinner` runs first and never
+  makes a system call, so the driver's first instruction already depends on preemption. With the `irq-idle` feature it parks,
+  and the kernel must idle. `scripts/irq-demo.sh` types `lantern` and checks the driver's count and byte sum, the echo, and that
+  QEMU used at most 0.3 s of CPU over 3 s of silence (it measured 0 ticks). Mutation-tested: a timer never armed fails the
+  spinner case, and an idle that polls instead of waiting fails the CPU check.
+- **The interactive system image (2026-11-11, [RFC-0026](../lantern-rfcs/rfcs/0026-trusted-path-and-consent.md)/[ADR-0032](../lantern-rfcs/adr/0032-trusted-path-and-consent.md)).** **`lantern-boot-system`** runs the shell, the binder `WITH_CONSENT`,
+  `policy-store`, the audited keystore and the runtime in system mode, with no narration once the shell starts. It needs the
+  flash attached. The shell gets the UART's 4 KiB page and line 10; the binder and shell share a consent `Frame`.
+  `scripts/console-matrix.sh` types at the console as a person would, and checks the screen and the audit log: 14 cases,
+  covering every answer, remembered ones across reboots, `revoke` and `forget`, a hostile justification, the ceiling, and
+  commands refused during a prompt. Mutation-tested: a binder that never asks, and a sanitizer that passes everything. The
+  audit ring moved to sectors 2 to 7, so `binder-matrix.sh`'s offsets and capacity followed; it still passes 62/62.
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.

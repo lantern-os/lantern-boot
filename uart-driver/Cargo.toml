@@ -1,0 +1,21 @@
+[package]
+name = "lantern-uart-driver"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0027's proof driver: a confined riscv64 program holding only the UART's 4 KiB device Frame, an IrqHandler for its line and a notification. It binds the line, waits for interrupts, and echoes what it reads. Loaded by lantern-boot's irq demo (src/irq_demo/). Built on lantern-abi and nothing else."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-uart-driver"
+path = "src/main.rs"
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

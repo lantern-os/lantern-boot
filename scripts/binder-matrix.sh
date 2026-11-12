@@ -164,7 +164,7 @@ KEEP=1 check 'store: KNOWN LIMIT, erasing restores' $P $K SUCCESS asis
 audit 'audit: erasing left one boot'               "$K1"
 
 # RFC-0024. `grant-control` verifies the chain and this boot's records inside every runtime `SUCCESS` above;
-# these check the log across boots, from outside. The audit log's header is at 0x40000, then 64-byte records.
+# these check the log across boots, from outside. The audit log's first header is at 0x80000 (sector 2, RFC-0026), then 64-byte records.
 check 'audit: first boot'                          $P $K SUCCESS asis
 audit 'audit: one boot is recorded'                "$K1"
 KEEP=1 check 'audit: second boot'                  $P $K FAILURE:8 asis
@@ -178,13 +178,13 @@ $(key probe-signing '"sign"')"
 audit 'audit: a refused grant is recorded'         'BOOT SERVICE_GRANTED GRANTING GRANT_FAILED'
 
 check 'audit: first boot, to edit'                 $P $K SUCCESS asis
-patch_image $((0x40044)) '\x5a\xa5\x5a\xa5'
+patch_image $((0x80044)) '\x5a\xa5\x5a\xa5'
 audit 'audit: an edited record reads as corrupt'   CORRUPT
 KEEP=1 check 'audit: corrupt log declines grants'  $F $L FAILURE:8 asis
 
 # Only the last record can be torn: the first boot writes 13, so the last is index 12.
 check 'audit: first boot, to tear'                 $P $K SUCCESS asis
-patch_image $((0x40040 + 12 * 64 + 60)) '\xff\xff\xff\xff'
+patch_image $((0x80040 + 12 * 64 + 60)) '\xff\xff\xff\xff'
 KEEP=1 check 'audit: a torn record recovers'       $F $L SUCCESS asis
 audit 'audit: and the chain continues'             "${K1% USE_FAILED:ACCESS} $F1"
 
@@ -213,20 +213,20 @@ audit 'use: the write past the quota never ran'    'BOOT SERVICE_GRANTED GRANTIN
 FEATURES=audit-quota-test check 'use: quota, keystore' $P $K FAILURE:8 asis
 audit 'use: a refused USE_FAILED is still named'   'BOOT GRANTING GRANTED DECLINED:NOT_DECLARED USING QUOTA_REACHED:ACCESS'
 
-# Retention. The ring holds 7 * 4095 records. Fill to five short of it, so the next boot retires sector 1 mid-run.
-# retention <label>: the dump must verify, hold from 4095, and show exactly one RETIRED, of sector 1.
+# Retention. The ring holds 6 * 4095 records, in sectors 2 to 7. Fill to five short of it, so the next boot retires sector 2 mid-run.
+# retention <label>: the dump must verify, hold from 4095, and show exactly one RETIRED, of sector 2.
 retention() {
     local label=$1 got
     got=$("$DUMP" "$IMAGE" | awk '/^CORRUPT/ { print "CORRUPT"; exit } /^oldest/ { oldest = $2 }
         /^record/ && $3 == "RETIRED" { retired = retired " " $6 } END { if (oldest != "") print "oldest=" oldest " retired:" retired }')
-    if [ "$got" = 'oldest=4095 retired: slot=1' ]; then
+    if [ "$got" = 'oldest=4095 retired: slot=2' ]; then
         printf 'ok    %-44s %s\n' "$label" "$got"
     else
-        printf 'FAIL  %-44s want oldest=4095 retired: slot=1, got %s\n' "$label" "$got"
+        printf 'FAIL  %-44s want oldest=4095 retired: slot=2, got %s\n' "$label" "$got"
         failures=$((failures + 1))
     fi
 }
-CAPACITY=$((7 * 4095))
+CAPACITY=$((6 * 4095))
 check 'retain: first boot, to keep its head'       $P $K SUCCESS asis
 EARLY=$("$DUMP" "$IMAGE" | sed -n 's/^chain ok count=\([0-9]*\) head=\([0-9a-f]*\)$/\1 \2/p')
 "$DUMP" "$IMAGE" --fill $((CAPACITY - 5 - ${EARLY%% *})) "$WORK/filled.img" >/dev/null
@@ -250,11 +250,11 @@ kept() {
 kept 'retain: a head kept after it still matches'   "$LATE" 0
 kept 'retain: a head kept before it is RETIRED'      "$EARLY" 4
 
-# A power cut mid-retirement: the ring is exactly full, and sector 1 is half erased, or erased with no header.
+# A power cut mid-retirement: the ring is exactly full, and sector 2 is half erased, or erased with no header.
 "$DUMP" "$ERASED" --fill "$CAPACITY" "$WORK/full.img" >/dev/null
 for cut in 'half erased:131072' 'erased, no header:262144'; do
     cp "$WORK/full.img" "$IMAGE"
-    head -c "${cut#*:}" "$ERASED" | dd of="$IMAGE" bs=1 seek=$((0x40000)) conv=notrunc status=none
+    head -c "${cut#*:}" "$ERASED" | dd of="$IMAGE" bs=1 seek=$((0x80000)) conv=notrunc status=none
     KEEP=1 check "retain: cut mid-erase, ${cut%:*}"  $P $K SUCCESS asis
     retention "retain: finished, ${cut%:*}"
 done

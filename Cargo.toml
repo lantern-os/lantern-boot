@@ -48,6 +48,18 @@ name = "lantern-boot-wasm-probe-demo"
 path = "src/wasm_probe_demo/main.rs"
 
 [[bin]]
+# RFC-0026's interactive system image: a person decides each grant at a console only the shell reaches.
+# See src/system/loader.rs's module doc.
+name = "lantern-boot-system"
+path = "src/system/main.rs"
+
+[[bin]]
+# RFC-0027's proof: a confined UART driver on its own interrupts, beside a program that never yields.
+# See src/irq_demo/loader.rs's module doc.
+name = "lantern-boot-irq-demo"
+path = "src/irq_demo/main.rs"
+
+[[bin]]
 # RFC-0018's integration proof: a confined lantern-runtime process hosting a
 # real Wasm guest component whose keystore grant is served over a shared Frame
 # by a separately confined keystore-service -- a seventh, isolated binary; see
@@ -71,6 +83,8 @@ lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch 
 # `binder-matrix.sh` only: lowers the policy store's per-grant quota of operation records to 1, so the quota
 # case runs in seconds (RFC-0025). It can only lower it.
 audit-quota-test = []
+# `scripts/irq-demo.sh` only: the irq demo's spinner parks instead of spinning, so the kernel must idle (RFC-0027).
+irq-idle = []
 
 [profile.dev]
 panic = "abort"
