@@ -48,6 +48,12 @@ name = "lantern-boot-wasm-probe-demo"
 path = "src/wasm_probe_demo/main.rs"
 
 [[bin]]
+# RFC-0028's proof: a confined program sleeps on deadlines, beside a program that never yields.
+# See src/deadline_demo/loader.rs's module doc.
+name = "lantern-boot-deadline-demo"
+path = "src/deadline_demo/main.rs"
+
+[[bin]]
 # RFC-0026's interactive system image: a person decides each grant at a console only the shell reaches.
 # See src/system/loader.rs's module doc.
 name = "lantern-boot-system"
@@ -85,6 +91,11 @@ lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch 
 audit-quota-test = []
 # `scripts/irq-demo.sh` only: the irq demo's spinner parks instead of spinning, so the kernel must idle (RFC-0027).
 irq-idle = []
+# `scripts/console-matrix.sh` only: lowers the system image's consent limit from 60 to 2 seconds (RFC-0028). It can only
+# lower it.
+consent-limit-test = []
+# `scripts/deadline-demo.sh` only: the deadline demo's spinner parks, so the kernel idles between wakes (RFC-0028).
+deadline-idle = []
 
 [profile.dev]
 panic = "abort"

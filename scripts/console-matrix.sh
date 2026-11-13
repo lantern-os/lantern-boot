@@ -39,10 +39,11 @@ fail() {
     failures=$((failures + 1))
 }
 
-# boot: builds the image with the current assets and starts it on $IMAGE, reading the console into $OUT.
+# boot: builds the image with the current assets, and FEATURES if set, and starts it on $IMAGE, reading the console into
+# $OUT.
 boot() {
     [ -n "${KEEP:-}" ] || cp "$ERASED" "$IMAGE"
-    cargo build -q --release --bin lantern-boot-system || exit 2
+    cargo build -q --release --bin lantern-boot-system ${FEATURES:+--features "$FEATURES"} || exit 2
     rm -f "$WORK/in"
     mkfifo "$WORK/in"
     qemu-system-riscv64 -machine virt -bios default -nographic -m 128M \
@@ -244,6 +245,23 @@ expect "$PROMPT" && type_line y && expect "$DONE"
 type_line 'run something' && expect 'lantern: unknown command; type help.'
 type_line help && expect 'revoke N     end grant N now'
 stop
+ok
+
+# RFC-0028: a request has a limit. The `consent-limit-test` feature lowers it from 60 s to 2 s.
+case_ 'nobody answers: the request times out'
+FEATURES=consent-limit-test boot
+expect "$PROMPT" && expect 'lantern: nobody answered in time, so the request was refused.' && expect "$FAILED"
+stop
+audit_is 'BOOT DECLINED:NO_CONSENT'
+ok
+
+case_ 'an answer after the timeout is too late'
+FEATURES=consent-limit-test boot
+expect "$PROMPT" && expect 'lantern: nobody answered in time' && type_line y
+expect 'lantern: too late: that request timed out, and was refused.'
+grep -aqF 'lantern: allowed' "$OUT" && fail 'a late answer was reported as counting'
+stop
+audit_is 'BOOT DECLINED:NO_CONSENT'
 ok
 
 [ "$failures" -eq 0 ] && echo 'all matched' || { echo "$failures mismatched"; exit 1; }

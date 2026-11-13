@@ -235,6 +235,20 @@ pub const WITH_CONSENT: usize = 1 << 40;
 pub const BINDER_SHELL_ASK_CPTR: CPtr = 9;
 #[allow(dead_code)]
 pub const BINDER_ANSWER_CPTR: CPtr = 10;
+/// RFC-0028: the binder's `Deadline`, its answer notification badged `TIMED_OUT`, and the shell's notification badged
+/// `ASK_DONE` and `ASK_CANCELLED`. Must match `launch-binder`.
+#[allow(dead_code)]
+pub const BINDER_DEADLINE_CPTR: CPtr = 11;
+#[allow(dead_code)]
+pub const BINDER_ANSWER_TIMED_OUT_CPTR: CPtr = 12;
+#[allow(dead_code)]
+pub const BINDER_SHELL_DONE_CPTR: CPtr = 13;
+#[allow(dead_code)]
+pub const BINDER_SHELL_CANCELLED_CPTR: CPtr = 14;
+/// The binder's `arg0` bits for its consent limit in seconds: 0 is the default, 60. Only `console-matrix.sh` lowers it, to
+/// 2, through the `consent-limit-test` feature. It can only lower it.
+#[allow(dead_code)]
+pub const BINDER_CONSENT_LIMIT: usize = if cfg!(feature = "consent-limit-test") { 2 << 48 } else { 0 };
 #[allow(dead_code)]
 pub const CONSENT_VADDR: usize = 0x9000_0000;
 /// The launch binder's capability slots (`lantern-shell/launch-binder/src/main.rs`).
@@ -758,6 +772,16 @@ pub fn map_small_device_frame(state: &mut KernelState, root: TcbId, paddr: usize
 #[allow(dead_code)]
 pub fn irq_handler(state: &mut KernelState, root: TcbId, line: u16, dest: CPtr) {
     let cap = lantern_kernel::irq::create(state, line).expect("one handler per line, and room in the pool");
+    let cnode = state.tcbs.get(root.0 as usize).unwrap().cspace.expect("root has a CSpace");
+    *state.cnodes.get_mut(cnode.0 as usize).unwrap().slot_mut(dest).unwrap() = cap;
+}
+
+/// Puts a `Deadline` in the launcher's slot `dest`, to grant like any other capability. Only boot code creates them
+/// ([RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md)), and holding one is the only way to read
+/// the clock.
+#[allow(dead_code)]
+pub fn deadline(state: &mut KernelState, root: TcbId, dest: CPtr) {
+    let cap = lantern_kernel::deadline::create(state).expect("room in the deadline pool");
     let cnode = state.tcbs.get(root.0 as usize).unwrap().cspace.expect("root has a CSpace");
     *state.cnodes.get_mut(cnode.0 as usize).unwrap().slot_mut(dest).unwrap() = cap;
 }
