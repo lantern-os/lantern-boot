@@ -708,6 +708,42 @@ pub fn map_package(
     delete(state, root, frame_cptr);
 }
 
+/// [RFC-0029](../../lantern-rfcs/rfcs/0029-a-confined-launcher.md)'s package-set format: each of `entries` in its own
+/// fresh `FrameMega`, its length (8 bytes, little-endian) then its bytes, mapped **read-only** at `vaddr + i × 2 MiB` in
+/// each of `vspaces`, at most two (a Frame's mapping limit). Nobody gets a capability to the Frames, and root drops its
+/// own, so nothing can remap or write them. Each program that reads one verifies it itself.
+#[allow(dead_code)]
+pub fn map_set(
+    state: &mut KernelState,
+    root: TcbId,
+    untyped_cptr: CPtr,
+    entries: &[&[u8]],
+    vspaces: &[CPtr],
+    vaddr: usize,
+    next_slot: &mut CPtr,
+) {
+    const HEADER: usize = 8;
+    let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
+    for (i, entry) in entries.iter().enumerate() {
+        assert!(entry.len() + HEADER <= mega, "a set entry must fit one megapage with its length");
+        let frame_cptr = *next_slot;
+        let Capability::Frame { id, .. } = retype_frame(state, root, untyped_cptr, ObjectType::FrameMega, frame_cptr) else {
+            panic!("expected a Frame capability");
+        };
+        let paddr = state.frames.get(id.0 as usize).unwrap().paddr;
+        // SAFETY: as `map_package`'s: a Frame just retyped and zeroed, the launcher's alone, reached physically here;
+        // the length and bytes fit it (asserted).
+        unsafe {
+            core::ptr::copy_nonoverlapping((entry.len() as u64).to_le_bytes().as_ptr(), paddr as *mut u8, HEADER);
+            core::ptr::copy_nonoverlapping(entry.as_ptr(), (paddr + HEADER) as *mut u8, entry.len());
+        }
+        for &vspace in vspaces {
+            map(state, root, frame_cptr, vspace, vaddr + i * mega, PERM_R | PERM_U);
+        }
+        delete(state, root, frame_cptr);
+    }
+}
+
 /// Maps one megapage of device memory at `paddr` read/write into `vspace` (RFC-0022). Nothing here is
 /// a general device capability: the launcher, already trusted with every physical range, names this
 /// one. Its `Untyped` is a device one, so the kernel never zeroes it on retype
