@@ -510,6 +510,23 @@
   - **Other changes:** the device `Untyped`s for flash and the UART are now `Untyped::device`, which the kernel never writes.
     `launch::retype_frame` no longer clears Frames itself, since the kernel does. `dirty-ram.sh` covers 8 demos and fails
     3 when kernel zeroing is switched off.
+- **The system image runs the apps a person chooses (2026-11-14, [RFC-0029](../lantern-rfcs/rfcs/0029-a-confined-launcher.md)/[ADR-0035](../lantern-rfcs/adr/0035-a-confined-launcher.md)).** `lantern-boot-system` now starts six
+  programs and no app: the shell, the new `launcher`, the binder (`WITH_LAUNCHER`), the policy store, `keystore-service`
+  and `store-service`.
+  - **Services:** the keystore runs its new system profile, with an app signing key and the store's sealing key. The
+    store runs `MANY_CLIENTS`. Both have one channel per app slot, made here from system memory, mapped into them for good,
+    and handed to the launcher.
+  - **The launcher** holds a 72 MiB `Untyped` for apps, the package set (`probe.lpkg`, `fs-probe.lpkg`, in
+    `launch::map_set`'s format, shared with the binder), the runtime's ELF, and boot-minted badges for registering and for
+    each slot.
+  - **Before any app:** 104 root slots, 36 Frames, 7 CNodes, 6 VSpaces, 7 TCBs and 29 page tables. The image needs
+    `-m 256M`.
+  - **`console-matrix.sh`: 21 cases.** Every app is started with `run`. New cases cover:
+    - `apps`, and unknown names;
+    - the filesystem app twice;
+    - 7 runs across 4 slots, each grant ending with its app;
+    - with the `launcher-hold-test` feature, four apps at once, their grants in `grants`, and "no room" for a fifth;
+    - a tampered package that's neither listed nor run.
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.

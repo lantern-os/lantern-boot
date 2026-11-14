@@ -100,6 +100,9 @@ irq-idle = []
 # `scripts/console-matrix.sh` only: lowers the system image's consent limit from 60 to 2 seconds (RFC-0028). It can only
 # lower it.
 consent-limit-test = []
+# `scripts/console-matrix.sh` only: the system image's launcher keeps each ended app resident instead of reclaiming it, so
+# a test can fill every app slot (RFC-0029). It can only keep apps longer.
+launcher-hold-test = []
 # `scripts/deadline-demo.sh` only: the deadline demo's spinner parks, so the kernel idles between wakes (RFC-0028).
 deadline-idle = []
 

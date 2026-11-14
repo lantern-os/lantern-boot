@@ -44,7 +44,7 @@
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::{self, status, Channel, Interloper};
+use lantern_abi::frame::{self, status, Channel, ChannelMap, Interloper};
 use lantern_abi::grant::{self, Incoming};
 use lantern_abi::policy::{self, event, AuditEntry};
 use lantern_abi::sys::{self, Received};
@@ -81,6 +81,13 @@ const KS_FRAME_VADDR: usize = 0x9000_0000;
 /// [`KS_FRAME_VADDR`] (two independent physical Frames, two mappings) — must
 /// match `store-client`'s own `FRAME_VADDR`.
 const CLIENT_FRAME_VADDR: usize = 0x9001_0000;
+
+/// With [`grant::MANY_CLIENTS`] ([RFC-0029](../../lantern-rfcs/rfcs/0029-a-confined-launcher.md)): one client channel
+/// per app slot, `CHANNEL_STRIDE` apart from [`CLIENT_FRAME_VADDR`]. Each badge is served on the channel its `GRANT` named,
+/// and only there.
+const CHANNEL_STRIDE: usize = 0x1000;
+/// Live grants with a channel. Matches `lantern_filesystem`'s own grant capacity.
+const MAPPED_GRANTS: usize = 32;
 
 /// Large enough for this demo's small READ/WRITE payloads — see
 /// `keystore-service`'s identical constant for the general sizing rule.
@@ -132,13 +139,25 @@ fn run(arg0: usize) -> ! {
 
     // SAFETY: as above, for `CLIENT_FRAME_VADDR` (the loader's *second*
     // `map_shared_frame` call).
-    let mut client_channel = unsafe { Channel::new(CLIENT_ENDPOINT_CPTR, CLIENT_FRAME_VADDR as *mut u8) };
+    // With `MANY_CLIENTS`, one per app slot; otherwise only the first exists, and only it is used.
+    let many = arg0 & grant::MANY_CLIENTS != 0;
+    let mut channels = ChannelMap::<MAPPED_GRANTS>::default();
+    // SAFETY: as above, for each channel the loader mapped; an unmapped one is never reached.
+    let mut all: [Channel; grant::APP_SLOTS] = core::array::from_fn(|c| unsafe {
+        Channel::new(CLIENT_ENDPOINT_CPTR, (CLIENT_FRAME_VADDR + c * CHANNEL_STRIDE) as *mut u8)
+    });
     loop {
         let Ok(received) = sys::recv(CLIENT_ENDPOINT_CPTR) else { continue };
         match grant::classify(&received) {
             Incoming::Data => {
+                let Some(channel) = (if many { channels.channel_for(received.badge) } else { Some(0) }) else {
+                    // A badge this store never tied to a channel: nothing can be written back, so the label refuses it.
+                    let _ = sys::reply_with_label(status::ACCESS as u32, [0, 0, 0]);
+                    continue;
+                };
+                let client_channel = &mut all[channel as usize];
                 let mut request = [0u8; REQUEST_CAP];
-                let mut others = Others { store: &mut store, backend: &mut backend };
+                let mut others = Others { store: &mut store, backend: &mut backend, channels: &mut channels, many };
                 if let Ok((op, len)) = client_channel.recv_request(received, &mut request, &mut others) {
                     // The keystore-service leg: Store's own encrypt/decrypt reach
                     // the AEAD key over real IPC, not a direct &Keystore call.
@@ -160,12 +179,12 @@ fn run(arg0: usize) -> ! {
                         }
                         _ => handle(),
                     };
-                    let mut others = Others { store: &mut store, backend: &mut backend };
+                    let mut others = Others { store: &mut store, backend: &mut backend, channels: &mut channels, many };
                     let _ = client_channel.reply(status, &reply[..reply_len], received.badge, &mut others);
                 }
                 // `recv_request`'s `Err` path has already sent `INVALID` itself.
             }
-            _ => Others { store: &mut store, backend: &mut backend }.serve(received),
+            _ => Others { store: &mut store, backend: &mut backend, channels: &mut channels, many }.serve(received),
         }
     }
 }
@@ -175,12 +194,24 @@ fn run(arg0: usize) -> ! {
 struct Others<'a> {
     store: &'a mut Store,
     backend: &'a mut Abi,
+    channels: &'a mut ChannelMap<MAPPED_GRANTS>,
+    many: bool,
 }
 
 impl Interloper for Others<'_> {
     fn serve(&mut self, received: Received) {
         match grant::classify(&received) {
-            Incoming::Grant { object, ops } => serve_grant(self.store, self.backend, object, ops),
+            Incoming::Grant { object, ops, channel } => {
+                let channel = match (self.many, channel) {
+                    (false, _) => None,
+                    (true, Some(c)) if c < grant::APP_SLOTS => Some(c as u8),
+                    (true, _) => {
+                        let _ = grant::reply_status(status::INVALID);
+                        return;
+                    }
+                };
+                serve_grant(self.store, self.backend, self.channels, object, ops, channel)
+            }
             Incoming::Revoke { badge } => {
                 let status = if self.store.revoke_access(badge).is_ok() { status::OK } else { status::INVALID };
                 let _ = grant::reply_status(status);
@@ -210,7 +241,14 @@ fn op_bit(op: u16) -> u8 {
 /// RFC-0020's `GRANT`: mint exactly `ops` on `object` and hand the badge back. The
 /// checks that matter (the file exists and isn't destroyed) are
 /// `request_file_access`'s own.
-fn serve_grant(store: &mut Store, backend: &mut Abi, object: usize, ops: usize) {
+fn serve_grant(
+    store: &mut Store,
+    backend: &mut Abi,
+    channels: &mut ChannelMap<MAPPED_GRANTS>,
+    object: usize,
+    ops: usize,
+    channel: Option<u8>,
+) {
     let request = u16::try_from(object)
         .ok()
         .zip(u8::try_from(ops).ok().filter(|&bits| bits != 0).and_then(FileOps::from_bits));
@@ -218,9 +256,17 @@ fn serve_grant(store: &mut Store, backend: &mut Abi, object: usize, ops: usize) 
         let _ = grant::reply_status(status::INVALID);
         return;
     };
-    let granted = store
-        .request_file_access(backend, FileId::from_raw(object), ops, CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR)
-        .and_then(|badge| store.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, badge as usize)));
+    // Room for the badge's channel first, so a badge is never delivered without one.
+    if channel.is_some() && !channels.has_room(|b| store.is_revoked(b)) {
+        let _ = grant::reply_status(status::FAILED);
+        return;
+    }
+    let granted = store.request_file_access(backend, FileId::from_raw(object), ops, CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR).and_then(|badge| {
+        if let Some(c) = channel {
+            channels.bind(badge, c, |b| store.is_revoked(b));
+        }
+        store.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, badge as usize))
+    });
     if granted.is_err() {
         let _ = grant::reply_status(status::INVALID);
     }

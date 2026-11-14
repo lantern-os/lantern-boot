@@ -41,6 +41,13 @@
 //! the launch binder, and never to its first caller. In every mode, a `GRANT`
 //! from anyone else is refused `ACCESS`.
 //!
+//! **[`PROFILE_SYSTEM`]** ([RFC-0029](../../lantern-rfcs/rfcs/0029-a-confined-launcher.md)) serves the interactive
+//! system's many apps. It holds both keys: the signing key (`KeyId` 0), which the binder grants to apps, and the AEAD key
+//! (`KeyId` 1), granted once to its first caller, the store. It then has one channel per app slot, at
+//! `FRAME_VADDR + slot × 4 KiB`, and the store's after them. Each badge it mints is tied to the channel the binder's
+//! `GRANT` named (`frame::ChannelMap`), and is served on that channel only; a badge with no channel is refused. So an app
+//! can never reach another app's channel.
+//!
 //! The [`grant::AUDITED`] flag ([RFC-0025](../../lantern-rfcs/rfcs/0025-audit-log-service-operations.md))
 //! makes this instance record every use of a grant in the policy store's audit log, through
 //! [`policy::audited`], before the operation runs, and its own first-caller grant before delivering
@@ -50,7 +57,7 @@
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::{self, status, Channel, Interloper};
+use lantern_abi::frame::{self, status, Channel, ChannelMap, Interloper};
 use lantern_abi::grant::{self, Incoming};
 use lantern_abi::policy::{self, event, AuditEntry};
 use lantern_abi::sys::{self, Received};
@@ -87,6 +94,13 @@ const DEMO_SIGNING_SEED: [u8; 32] = [0x24; 32];
 /// `arg0` values — see the module doc. Must match each loader's own constant.
 const PROFILE_AEAD: usize = 0;
 const PROFILE_SIGNING: usize = 1;
+const PROFILE_SYSTEM: usize = 2;
+/// With [`PROFILE_SYSTEM`]: one channel per app slot, then the store's.
+const CHANNELS: usize = grant::APP_SLOTS + 1;
+const STORE_CHANNEL: u8 = grant::APP_SLOTS as u8;
+const CHANNEL_STRIDE: usize = 0x1000;
+/// Live grants with a channel. Matches `lantern_crypto`'s own grant capacity.
+const MAPPED_GRANTS: usize = 32;
 /// The profile is `arg0`'s low byte; every flag (`grant::BINDER_LAUNCHED`, `grant::AUDITED`) is above it.
 const PROFILE_MASK: usize = 0xff;
 
@@ -97,18 +111,25 @@ const REQUEST_CAP: usize = 256;
 
 fn run(arg0: usize) -> ! {
     let mut keystore = Keystore::new(SELF_CNODE_CPTR);
+    let system = arg0 & PROFILE_MASK == PROFILE_SYSTEM;
     let (key, ops) = match arg0 & PROFILE_MASK {
         PROFILE_SIGNING => (keystore.generate_signing_key(DEMO_SIGNING_SEED), KeyOps::SIGN),
         PROFILE_AEAD => (keystore.generate_aead_key(DEMO_AEAD_SEED), KeyOps::ENCRYPT.union(KeyOps::DECRYPT)),
+        PROFILE_SYSTEM => {
+            // `KeyId` 0, as `lantern-shell`'s `POLICY` names it for apps; the store's key after it.
+            keystore.generate_signing_key(DEMO_SIGNING_SEED).unwrap();
+            (keystore.generate_aead_key(DEMO_AEAD_SEED), KeyOps::ENCRYPT.union(KeyOps::DECRYPT))
+        }
         _ => panic!("keystore-service: unknown arg0 profile"),
     };
     let key = key.unwrap();
+    let mut channels = ChannelMap::<MAPPED_GRANTS>::default();
     let mut backend = Abi;
     let audited = arg0 & grant::AUDITED != 0;
 
     // Phase 1: one client Call's, registering its own reply-leg destination;
-    // grant it `ops` on the one demo key.
-    if arg0 & grant::BINDER_LAUNCHED == 0 {
+    // grant it `ops` on the one demo key. With the system profile, that client is the store.
+    if arg0 & grant::BINDER_LAUNCHED == 0 || system {
         let _ = sys::recv(ENDPOINT_CPTR);
         // Recorded after minting, since the badge is the record, and before delivering: an unrecorded
         // grant never reaches its holder. It is withdrawn instead, and the caller told, and this service
@@ -124,6 +145,7 @@ fn run(arg0: usize) -> ! {
             };
             !audited || policy::append(AUDIT_CPTR, &entry) == Ok(status::OK)
         });
+        let recorded = recorded.filter(|&badge| !system || channels.bind(badge, STORE_CHANNEL, |_| false));
         let delivered = recorded.is_some_and(|_| keystore.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)).is_ok());
         if !delivered {
             if let Some(badge) = minted {
@@ -141,13 +163,24 @@ fn run(arg0: usize) -> ! {
     // SAFETY: the loader mapped `FRAME_VADDR..+FRAME_LEN` read/write into
     // this program's own VSpace before its first instruction ran
     // (`keystore_demo/loader.rs`'s `map_shared_frame` call).
-    let mut channel = unsafe { Channel::new(ENDPOINT_CPTR, FRAME_VADDR as *mut u8) };
+    // With the system profile, the loader mapped every channel's Frame, `CHANNEL_STRIDE` apart. Otherwise only channel
+    // 0 exists, and only it is ever used.
+    let mut all: [Channel; CHANNELS] =
+        // SAFETY: as above, for each channel the loader mapped; an unmapped one is never reached.
+        core::array::from_fn(|c| unsafe { Channel::new(ENDPOINT_CPTR, (FRAME_VADDR + c * CHANNEL_STRIDE) as *mut u8) });
     loop {
         let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
         match grant::classify(&received) {
             Incoming::Data => {
+                let Some(channel) = (if system { channels.channel_for(received.badge) } else { Some(0) }) else {
+                    // No channel: a badge this service never tied to one. Nothing can be written back, so the label
+                    // alone refuses it.
+                    let _ = sys::reply_with_label(status::ACCESS as u32, [0, 0, 0]);
+                    continue;
+                };
+                let channel = &mut all[channel as usize];
                 let mut request = [0u8; REQUEST_CAP];
-                let mut others = Others { keystore: &mut keystore, backend: &mut backend };
+                let mut others = Others { keystore: &mut keystore, backend: &mut backend, channels: &mut channels, system };
                 if let Ok((op, len)) = channel.recv_request(received, &mut request, &mut others) {
                     let mut reply = [0u8; REQUEST_CAP];
                     let mut handle =
@@ -165,12 +198,12 @@ fn run(arg0: usize) -> ! {
                         }
                         _ => handle(),
                     };
-                    let mut others = Others { keystore: &mut keystore, backend: &mut backend };
+                    let mut others = Others { keystore: &mut keystore, backend: &mut backend, channels: &mut channels, system };
                     let _ = channel.reply(status, &reply[..reply_len], received.badge, &mut others);
                 }
                 // `recv_request`'s `Err` path has already sent `INVALID` itself.
             }
-            _ => Others { keystore: &mut keystore, backend: &mut backend }.serve(received),
+            _ => Others { keystore: &mut keystore, backend: &mut backend, channels: &mut channels, system }.serve(received),
         }
     }
 }
@@ -180,12 +213,25 @@ fn run(arg0: usize) -> ! {
 struct Others<'a> {
     keystore: &'a mut Keystore,
     backend: &'a mut Abi,
+    channels: &'a mut ChannelMap<MAPPED_GRANTS>,
+    system: bool,
 }
 
 impl Interloper for Others<'_> {
     fn serve(&mut self, received: Received) {
         match grant::classify(&received) {
-            Incoming::Grant { object, ops } => serve_grant(self.keystore, self.backend, object, ops),
+            Incoming::Grant { object, ops, channel } => {
+                // With the system profile, every grant is for an app slot's channel, which the binder names.
+                let channel = match (self.system, channel) {
+                    (false, _) => None,
+                    (true, Some(c)) if c < grant::APP_SLOTS => Some(c as u8),
+                    (true, _) => {
+                        let _ = grant::reply_status(status::INVALID);
+                        return;
+                    }
+                };
+                serve_grant(self.keystore, self.backend, self.channels, object, ops, channel)
+            }
             Incoming::Revoke { badge } => {
                 let status = if self.keystore.revoke_access(badge).is_ok() { status::OK } else { status::INVALID };
                 let _ = grant::reply_status(status);
@@ -216,7 +262,14 @@ fn op_bit(op: u16) -> u8 {
 /// RFC-0020's `GRANT`: mint exactly `ops` on `object` and hand the badge back. The
 /// checks that matter (the key exists, isn't destroyed, and supports `ops`) are
 /// `request_key_access`'s own.
-fn serve_grant(keystore: &mut Keystore, backend: &mut Abi, object: usize, ops: usize) {
+fn serve_grant(
+    keystore: &mut Keystore,
+    backend: &mut Abi,
+    channels: &mut ChannelMap<MAPPED_GRANTS>,
+    object: usize,
+    ops: usize,
+    channel: Option<u8>,
+) {
     let request = u16::try_from(object)
         .ok()
         .zip(u8::try_from(ops).ok().filter(|&bits| bits != 0).and_then(KeyOps::from_bits));
@@ -224,9 +277,17 @@ fn serve_grant(keystore: &mut Keystore, backend: &mut Abi, object: usize, ops: u
         let _ = grant::reply_status(status::INVALID);
         return;
     };
-    let granted = keystore
-        .request_key_access(backend, KeyId::from_raw(object), ops, ENDPOINT_CPTR, SCRATCH_CPTR)
-        .and_then(|badge| keystore.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, badge as usize)));
+    // Room for the badge's channel first, so a badge is never delivered without one.
+    if channel.is_some() && !channels.has_room(|b| keystore.is_revoked(b)) {
+        let _ = grant::reply_status(status::FAILED);
+        return;
+    }
+    let granted = keystore.request_key_access(backend, KeyId::from_raw(object), ops, ENDPOINT_CPTR, SCRATCH_CPTR).and_then(|badge| {
+        if let Some(c) = channel {
+            channels.bind(badge, c, |b| keystore.is_revoked(b));
+        }
+        keystore.deliver_grant_via_reply(backend, SCRATCH_CPTR, (status::OK as usize, badge as usize))
+    });
     if granted.is_err() {
         let _ = grant::reply_status(status::INVALID);
     }
