@@ -64,6 +64,10 @@ const BIT_ASK: u64 = 1 << 1;
 const BIT_APP_DONE: u64 = 1 << 2;
 const BIT_APP_FAILED: u64 = 1 << 3;
 const BIT_SYSTEM_FAILED: u64 = 1 << 4;
+const BIT_ASK_DONE: u64 = 1 << 5;
+const BIT_ASK_CANCELLED: u64 = 1 << 6;
+/// `lantern_abi::consent::TIMED_OUT`, on the binder's answer notification.
+const BIT_TIMED_OUT: u64 = 1 << 4;
 const ANSWER_BADGES: [u64; 4] = [1 << 0, 1 << 1, 1 << 2, 1 << 3];
 
 const UART_PADDR: usize = 0x1000_0000;
@@ -121,9 +125,15 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let app_done_bit = mint(state, &mut next_slot, shell_notify, Rights::WRITE, BIT_APP_DONE);
     let app_failed_bit = mint(state, &mut next_slot, shell_notify, Rights::WRITE, BIT_APP_FAILED);
     let system_failed_bit = mint(state, &mut next_slot, shell_notify, Rights::WRITE, BIT_SYSTEM_FAILED);
+    let ask_done_bit = mint(state, &mut next_slot, shell_notify, Rights::WRITE, BIT_ASK_DONE);
+    let ask_cancelled_bit = mint(state, &mut next_slot, shell_notify, Rights::WRITE, BIT_ASK_CANCELLED);
     // The binder's answer notification, and one write-only badge per answer, all the shell's.
     let answer = retype(state, &mut next_slot, ObjectType::Notification);
     let answers = ANSWER_BADGES.map(|badge| mint(state, &mut next_slot, answer, Rights::WRITE, badge));
+    // RFC-0028: the binder's deadline, bound by the binder to its own answer notification under `TIMED_OUT`.
+    let timed_out_bit = mint(state, &mut next_slot, answer, Rights::WRITE, BIT_TIMED_OUT);
+    let binder_deadline = slot(&mut next_slot);
+    launch::deadline(state, root, binder_deadline);
     let park = retype(state, &mut next_slot, ObjectType::Notification);
     let irq = slot(&mut next_slot);
     launch::irq_handler(state, root, UART_LINE, irq);
@@ -158,13 +168,17 @@ pub unsafe fn run(mem_end: usize) -> ! {
         },
         ProgramSpec {
             elf_bytes: LAUNCH_BINDER_ELF,
-            arg0: PROBE_LPKG.len() | launch::WITH_CONSENT,
+            arg0: PROBE_LPKG.len() | launch::WITH_CONSENT | launch::BINDER_CONSENT_LIMIT,
             grants: &[
                 (binder_endpoint, launch::BINDER_ENDPOINT_CPTR),
                 (policy_client, launch::BINDER_POLICY_STORE_CPTR),
                 (granter, launch::BINDER_KEYSTORE_GRANTER_CPTR),
                 (ask_bit, launch::BINDER_SHELL_ASK_CPTR),
                 (answer, launch::BINDER_ANSWER_CPTR),
+                (binder_deadline, launch::BINDER_DEADLINE_CPTR),
+                (timed_out_bit, launch::BINDER_ANSWER_TIMED_OUT_CPTR),
+                (ask_done_bit, launch::BINDER_SHELL_DONE_CPTR),
+                (ask_cancelled_bit, launch::BINDER_SHELL_CANCELLED_CPTR),
             ],
             self_cnode_dest: None,
             heap_megapages: launch::BINDER_HEAP_MEGAPAGES,

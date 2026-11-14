@@ -1,0 +1,21 @@
+[package]
+name = "lantern-nursery"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0030's proof program: a confined riscv64 program holding only an Untyped, which builds a child process from an embedded ELF through system calls, more times than any kernel pool has room for, and Resets its memory after each child finishes or faults. Loaded by lantern-boot's lifecycle demo (src/lifecycle_demo/)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-nursery"
+path = "src/main.rs"
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

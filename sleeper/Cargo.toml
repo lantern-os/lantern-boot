@@ -1,0 +1,21 @@
+[package]
+name = "lantern-sleeper"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0028's proof program: a confined riscv64 program that sleeps on Deadlines and checks each wake against the clock, which only a Deadline lets it read. Loaded by lantern-boot's deadline demo (src/deadline_demo/)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-sleeper"
+path = "src/main.rs"
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

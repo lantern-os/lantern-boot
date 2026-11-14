@@ -489,6 +489,27 @@
   covering every answer, remembered ones across reboots, `revoke` and `forget`, a hostile justification, the ceiling, and
   commands refused during a prompt. Mutation-tested: a binder that never asks, and a sanitizer that passes everything. The
   audit ring moved to sectors 2 to 7, so `binder-matrix.sh`'s offsets and capacity followed; it still passes 62/62.
+- **Deadlines (2026-11-12, [RFC-0028](../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md)/[ADR-0033](../lantern-rfcs/adr/0033-deadlines-and-a-capability-clock.md)).** A new tenth image, **`lantern-boot-deadline-demo`**: a confined `sleeper` holds two
+  `Deadline`s (`launch::deadline`), sleeps three times, and checks with `Now` that each wake came from the right deadline
+  alone and never early, that a cancelled one never fires, and that one already past fires at once. `scripts/deadline-demo.sh`
+  runs it beside a spinner (worst lateness about 3 ms) and with the `deadline-idle` feature (1 s sleeps, 0–1 CPU ticks over
+  3 s). The system image gives the binder its deadline; `console-matrix.sh` gains a timeout case and a too-late case, with
+  the `consent-limit-test` feature lowering the limit to 2 s. Mutation-tested: deadlines that never fire, an idle that
+  forgets them, a `Cancel` that doesn't disarm, and a binder that ignores its timeout.
+- **Process lifecycle (2026-11-13, [RFC-0030](../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)/[ADR-0034](../lantern-rfcs/adr/0034-process-lifecycle-faults-and-reclamation.md)).** A new eleventh image, **`lantern-boot-lifecycle-demo`**. A confined
+  `nursery`, holding an 8 MiB child `Untyped` and nothing else of the loader's, builds `lifecycle-child` 40 times from one
+  4 MiB slot, through system calls alone. Each build makes a VSpace, 4 KiB pages copied in through a scratch mapping, a
+  stack, a 2 MiB heap, a CNode, a scheduling context and a TCB, with `SetEntry` and a fault notification.
+  - **How each child ends:** finishing with its BSS, data and heap clean, or faulting four ways (a load page fault, an
+    illegal instruction, a store to its own code, a jump to nowhere). The nursery checks each with `ReadFault`, and every
+    tenth round resets its whole memory instead of the slot.
+  - **Why it proves reclamation:** forty children need many times the TCBs, VSpaces, Frames and page tables the kernel has,
+    and each fills its slot.
+  - **Results:** `scripts/lifecycle-demo.sh` passes 3/3, beside a spinner that never yields. A slot `Reset` takes 30–50 µs,
+    a whole-memory one 45–60 µs. The demo is mutation-tested (see `lantern-kernel/STATUS.md`).
+  - **Other changes:** the device `Untyped`s for flash and the UART are now `Untyped::device`, which the kernel never writes.
+    `launch::retype_frame` no longer clears Frames itself, since the kernel does. `dirty-ram.sh` covers 8 demos and fails
+    3 when kernel zeroing is switched off.
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.
