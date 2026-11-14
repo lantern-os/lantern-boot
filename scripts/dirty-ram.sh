@@ -13,7 +13,7 @@ head -c $((100 * 1024 * 1024)) /dev/zero | tr '\0' '\245' >"$WORK/dirty.bin"
 head -c 33554432 /dev/zero | tr '\0' '\377' >"$WORK/flash.img"
 
 failures=0
-for demo in frame broker keystore store wasm-probe runtime runtime-fs; do
+for demo in frame broker keystore store wasm-probe runtime runtime-fs lifecycle; do
     cargo build -q --release --bin "lantern-boot-$demo-demo" || exit 2
     cp "$WORK/flash.img" "$WORK/run.img"
     out="$WORK/qemu.out"

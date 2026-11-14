@@ -54,6 +54,12 @@ name = "lantern-boot-deadline-demo"
 path = "src/deadline_demo/main.rs"
 
 [[bin]]
+# RFC-0030's proof: a confined nursery builds, loses and reclaims child processes, more of them than any kernel pool
+# holds. See src/lifecycle_demo/loader.rs's module doc.
+name = "lantern-boot-lifecycle-demo"
+path = "src/lifecycle_demo/main.rs"
+
+[[bin]]
 # RFC-0026's interactive system image: a person decides each grant at a console only the shell reaches.
 # See src/system/loader.rs's module doc.
 name = "lantern-boot-system"

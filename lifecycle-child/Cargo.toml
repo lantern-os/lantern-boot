@@ -1,0 +1,21 @@
+[package]
+name = "lantern-lifecycle-child"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0030's child: a confined riscv64 program that a confined nursery builds, from 4 KiB pages, entirely through system calls. arg0 picks how it ends: it finishes, or it faults on purpose. Embedded in lantern-boot's nursery (nursery/)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-lifecycle-child"
+path = "src/main.rs"
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

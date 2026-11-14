@@ -70,7 +70,7 @@
 
 use lantern_hal::TrapFrame;
 use lantern_kernel::admin;
-use lantern_kernel::cap::{Capability, CPtr, ObjectType, Rights, TcbId, UntypedId, VSpaceId};
+use lantern_kernel::cap::{Capability, CPtr, ObjectType, Rights, TcbId, UntypedId};
 use lantern_kernel::cnode;
 use lantern_kernel::frame::{self as frame_invoke, LABEL_MAP};
 use lantern_kernel::object::{SavedContext, Untyped};
@@ -293,20 +293,25 @@ pub fn retype(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, object_t
     state.cnodes.get(cspace.0 as usize).unwrap().get(dest).unwrap()
 }
 
-/// [`retype`], for a Frame of ordinary memory, cleared before anything can see it. The kernel's retype
-/// only records an address, and it can't do this itself: general memory isn't mapped once paging is on,
-/// and a device Frame mustn't be written to at all ([`map_device_frame`]). RAM's power-on contents are
-/// otherwise visible to the program, and a program's BSS relies on this.
-/// `scripts/dirty-ram.sh` checks it, since QEMU's own RAM starts zeroed.
+/// Carves a child `Untyped` of `bytes` (a multiple of 2 MiB) from `untyped_cptr` into `dest`
+/// ([RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)): memory a program can build
+/// from, and `Reset`, without reaching anything the launcher made from the rest.
+#[allow(dead_code)]
+pub fn retype_untyped(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, dest: CPtr, bytes: usize) {
+    let mut frame = TrapFrame::zeroed();
+    frame.set_mr(1, ObjectType::Untyped as usize);
+    frame.set_mr(2, dest);
+    frame.set_mr(3, bytes);
+    admin::untyped_retype(state, root, untyped_cptr, &mut frame).expect("launcher retype must succeed");
+}
+
+/// [`retype`], for a Frame of ordinary memory. Since
+/// [RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md) the kernel zeroes every RAM Frame
+/// when it's retyped, through its direct map, so nothing here clears it. A program's BSS relies on that, and RAM's power-on
+/// contents would otherwise be visible: `scripts/dirty-ram.sh` checks it, since QEMU's own RAM starts zeroed.
 pub fn retype_frame(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, object_type: ObjectType, dest: CPtr) -> Capability {
     let capability = retype(state, root, untyped_cptr, object_type, dest);
-    let Capability::Frame { id, .. } = capability else {
-        panic!("expected a Frame capability");
-    };
-    let frame = state.frames.get(id.0 as usize).unwrap();
-    // SAFETY: a Frame just bump-allocated from the launcher's general-memory Untyped, so nothing else
-    // refers to it. The launcher reaches physical memory directly, as `load`'s segment copy does.
-    unsafe { core::ptr::write_bytes(frame.paddr as *mut u8, 0, frame.size.bytes()) };
+    assert!(matches!(capability, Capability::Frame { .. }), "expected a Frame capability");
     capability
 }
 
@@ -365,44 +370,6 @@ const UART_MEGAPAGE_BASE: usize = 0x1000_0000;
 /// QEMU `virt`'s PLIC: 4 MiB from here, S-mode-only, as `lantern_hal`'s `riscv64` interrupt path expects (RFC-0027).
 const PLIC_MEGAPAGE_BASE: usize = 0x0c00_0000;
 
-/// Maps both kernel megapages and the UART megapage into `vspace_id`'s root
-/// table, S-mode-only (no `USER` flag) — **not** through `FrameInvoke::Map`:
-/// these aren't retyped `Frame` objects, and `lantern-kernel` itself has no
-/// business knowing `lantern-boot`'s own kernel-image layout. See
-/// `loader.rs`'s original doc (unchanged reasoning, just relocated here).
-///
-/// Its own branch-table spares now come from `lantern-kernel`'s
-/// `KernelPageTables` (`state.kernel_page_tables`), not a caller-supplied
-/// Untyped — see that type's doc for why: it's the fix for a real bug found
-/// while adding [`ArenaGrant`]'s self-mapping (a confined program's own
-/// `FrameInvoke::Map`, after its own paging is active, couldn't dereference a
-/// `VSpace` root bump-allocated from general memory). `lantern-boot/STATUS.md`
-/// has the full writeup.
-pub fn map_kernel_shared(state: &mut KernelState, vspace_id: VSpaceId) {
-    let vspace_root = state.vspaces.get(vspace_id.0 as usize).unwrap().root as *mut lantern_hal::Riscv64PageTable;
-
-    let kernel_flags = lantern_hal::Riscv64PteFlags::READ
-        .union(lantern_hal::Riscv64PteFlags::WRITE)
-        .union(lantern_hal::Riscv64PteFlags::EXECUTE);
-    let mmio_flags = lantern_hal::Riscv64PteFlags::READ.union(lantern_hal::Riscv64PteFlags::WRITE);
-
-    let tables = &mut state.kernel_page_tables;
-    let mut alloc = || tables.alloc().expect("the kernel's own page-table arena must have room for kernel-shared L1 tables");
-    for &(vaddr, paddr, flags) in &[
-        (KERNEL_MEGAPAGE_BASE, KERNEL_MEGAPAGE_BASE, kernel_flags),
-        (KERNEL_MEGAPAGE_2_BASE, KERNEL_MEGAPAGE_2_BASE, kernel_flags),
-        (UART_MEGAPAGE_BASE, UART_MEGAPAGE_BASE, mmio_flags),
-        // RFC-0027: the PLIC's priorities and enables, then its threshold and claim, for the kernel's interrupt path.
-        (PLIC_MEGAPAGE_BASE, PLIC_MEGAPAGE_BASE, mmio_flags),
-        (PLIC_MEGAPAGE_BASE + lantern_hal::RISCV64_MEGAPAGE_SIZE, PLIC_MEGAPAGE_BASE + lantern_hal::RISCV64_MEGAPAGE_SIZE, mmio_flags),
-    ] {
-        // SAFETY: `vspace_root` is this VSpace's own freshly built, exclusively
-        // owned root table; `vaddr`/`paddr` are megapage-aligned machine
-        // constants.
-        unsafe { lantern_hal::riscv64_map_megapage(vspace_root, vaddr, paddr, flags, &mut alloc) };
-    }
-}
-
 /// Maps `frame_cptr` (in `root`'s CSpace) into `vspace_cptr`'s (also `root`'s
 /// CSpace) VSpace at `vaddr`, with `perms` (see `PERM_*` above).
 pub fn map(state: &mut KernelState, root: TcbId, frame_cptr: CPtr, vspace_cptr: CPtr, vaddr: usize, perms: usize) {
@@ -412,6 +379,32 @@ pub fn map(state: &mut KernelState, root: TcbId, frame_cptr: CPtr, vspace_cptr: 
     invoke_frame.set_mr(2, vaddr);
     invoke_frame.set_mr(3, perms);
     frame_invoke::invoke(state, root, frame_cptr, &mut invoke_frame).expect("launcher map must succeed");
+}
+
+/// Gives the kernel, once, the S-mode-only mappings every VSpace needs
+/// ([RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)): both kernel megapages, the
+/// UART's, the PLIC's two, and the direct map of RAM. From then on, the kernel puts them into every VSpace it retypes,
+/// whether boot code or a confined launcher asked: this module no longer writes kernel mappings into page tables itself.
+pub fn register_kernel_template(state: &mut KernelState) {
+    if !state.kernel_template.is_empty() {
+        return;
+    }
+    let kernel_flags = lantern_hal::Riscv64PteFlags::READ
+        .union(lantern_hal::Riscv64PteFlags::WRITE)
+        .union(lantern_hal::Riscv64PteFlags::EXECUTE);
+    let mmio_flags = lantern_hal::Riscv64PteFlags::READ.union(lantern_hal::Riscv64PteFlags::WRITE);
+    let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
+    for &(base, flags) in &[
+        (KERNEL_MEGAPAGE_BASE, kernel_flags),
+        (KERNEL_MEGAPAGE_2_BASE, kernel_flags),
+        (UART_MEGAPAGE_BASE, mmio_flags),
+        // RFC-0027: the PLIC's priorities and enables, then its threshold and claim, for the kernel's interrupt path.
+        (PLIC_MEGAPAGE_BASE, mmio_flags),
+        (PLIC_MEGAPAGE_BASE + mega, mmio_flags),
+    ] {
+        assert!(lantern_kernel::vspace::add_kernel_megapage(state, base, base, flags), "kernel template full");
+    }
+    assert!(lantern_kernel::vspace::install_direct_map(state), "no page tables for the direct map");
 }
 
 /// Loads `spec.elf_bytes` into a fresh VSpace and TCB, wires in every
@@ -425,11 +418,10 @@ pub fn load(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, spec: &Pro
 
     let vspace_cptr = *next_slot;
     *next_slot += 1;
-    let Capability::VSpace { id: vspace_id, .. } = retype(state, root, untyped_cptr, ObjectType::VSpace, vspace_cptr)
-    else {
+    register_kernel_template(state);
+    let Capability::VSpace { .. } = retype(state, root, untyped_cptr, ObjectType::VSpace, vspace_cptr) else {
         panic!("expected a VSpace capability");
     };
-    map_kernel_shared(state, vspace_id);
 
     let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
 
@@ -718,14 +710,14 @@ pub fn map_package(
 
 /// Maps one megapage of device memory at `paddr` read/write into `vspace` (RFC-0022). Nothing here is
 /// a general device capability: the launcher, already trusted with every physical range, names this
-/// one, and retype doesn't write to it (`admin::untyped_retype` only records the address), which is
-/// why this alone uses plain [`retype`] rather than [`retype_frame`]. `paddr`
+/// one. Its `Untyped` is a device one, so the kernel never zeroes it on retype
+/// ([RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)). `paddr`
 /// must be megapage-aligned.
 #[allow(dead_code)]
 pub fn map_device_frame(state: &mut KernelState, root: TcbId, paddr: usize, vspace: CPtr, vaddr: usize, next_slot: &mut CPtr) {
     let id = state
         .untypeds
-        .alloc(Untyped::with_memory(1, paddr, lantern_hal::RISCV64_MEGAPAGE_SIZE))
+        .alloc(Untyped::device(1, paddr, lantern_hal::RISCV64_MEGAPAGE_SIZE))
         .expect("untyped pool exhausted");
     let untyped_cptr = *next_slot;
     *next_slot += 1;
@@ -750,7 +742,7 @@ pub fn map_device_frame(state: &mut KernelState, root: TcbId, paddr: usize, vspa
 pub fn map_small_device_frame(state: &mut KernelState, root: TcbId, paddr: usize, vspace: CPtr, vaddr: usize, next_slot: &mut CPtr) {
     let id = state
         .untypeds
-        .alloc(Untyped::with_memory(1, paddr, lantern_hal::RISCV64_PAGE_SIZE))
+        .alloc(Untyped::device(1, paddr, lantern_hal::RISCV64_PAGE_SIZE))
         .expect("untyped pool exhausted");
     let untyped_cptr = *next_slot;
     *next_slot += 1;
