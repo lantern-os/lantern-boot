@@ -40,10 +40,18 @@
 //! `WRITE` and `READ` then reaches `keystore-service`, which records its own `ENCRYPT` and `DECRYPT`
 //! under this store's badge there.
 
+//!
+//! **With [`ON_DISK`]** ([RFC-0031](../../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md)), its
+//! files outlive a reboot. The store partition holds two image slots (`lantern_filesystem::image`). At start it loads the
+//! newest that verifies under its key, or starts empty if neither does. After every successful write it saves the next
+//! image to the older slot, and answers `OK` only once that's on the disk, so a write cut off mid-way leaves the last image
+//! whole.
+
 #![no_std]
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+use lantern_abi::block::{self, Client, SECTOR};
 use lantern_abi::frame::{self, status, Channel, ChannelMap, Interloper};
 use lantern_abi::grant::{self, Incoming};
 use lantern_abi::policy::{self, event, AuditEntry};
@@ -89,6 +97,16 @@ const CHANNEL_STRIDE: usize = 0x1000;
 /// Live grants with a channel. Matches `lantern_filesystem`'s own grant capacity.
 const MAPPED_GRANTS: usize = 32;
 
+/// An `arg0` flag: keep the files on the disk, through the volume.
+const ON_DISK: usize = 1 << 11;
+/// The volume, under its `STORE` badge, and where its channel is mapped.
+const VOLUME_CPTR: usize = 6;
+const VOLUME_VADDR: usize = 0x9002_0000;
+/// Each image slot's size: room for the largest image.
+const SLOT_SECTORS: usize = 32;
+const SLOT_BYTES: usize = SLOT_SECTORS * SECTOR;
+const _: () = assert!(lantern_filesystem::image::IMAGE_MAX <= SLOT_BYTES);
+
 /// Large enough for this demo's small READ/WRITE payloads — see
 /// `keystore-service`'s identical constant for the general sizing rule.
 const REQUEST_CAP: usize = 256;
@@ -102,8 +120,19 @@ fn run(arg0: usize) -> ! {
     // (`store_demo/loader.rs`'s first `map_shared_frame` call).
     let mut ks_channel = unsafe { Channel::new(KS_DEST_CPTR, KS_FRAME_VADDR as *mut u8) };
 
-    let mut store = Store::new(SELF_CNODE_CPTR);
-    let file = store.create().expect("fresh Store always has room for its first file");
+    let on_disk = arg0 & ON_DISK != 0;
+    // SAFETY: with ON_DISK, the loader mapped the channel shared with the volume read/write at VOLUME_VADDR.
+    let mut volume = on_disk.then(|| Client { channel: unsafe { Channel::new(VOLUME_CPTR, VOLUME_VADDR as *mut u8) } });
+    let mut image = [0u8; SLOT_BYTES];
+    let (mut store, mut seq, file) = match volume.as_mut().and_then(|v| load(v, &mut ks_channel, &mut image)) {
+        // File 0 is the one the policy names; an image always holds it, since this program created it.
+        Some((store, seq)) => (store, seq, FileId::from_raw(0)),
+        None => {
+            let mut store = Store::new(SELF_CNODE_CPTR);
+            let file = store.create().expect("fresh Store always has room for its first file");
+            (store, 0, file)
+        }
+    };
 
     let mut backend = Abi;
     let audited = arg0 & grant::AUDITED != 0;
@@ -167,7 +196,7 @@ fn run(arg0: usize) -> ! {
                     let granted_file = store.file_for_badge(received.badge);
                     let mut handle =
                         || wire::handle_request(&mut store, &mut cipher, received.badge, op, &request[..len], &mut reply);
-                    let (status, reply_len) = match granted_file {
+                    let (mut status, reply_len) = match granted_file {
                         Some(file) if audited => {
                             let using = AuditEntry {
                                 object: file.raw(),
@@ -179,6 +208,13 @@ fn run(arg0: usize) -> ! {
                         }
                         _ => handle(),
                     };
+                    // Durable before it's answered `OK`.
+                    if let (Some(volume), wire::OP_WRITE, status::OK) = (volume.as_mut(), op, status) {
+                        match save(volume, &store, &mut ks_channel, seq + 1, &mut image) {
+                            true => seq += 1,
+                            false => status = status::FAILED,
+                        }
+                    }
                     let mut others = Others { store: &mut store, backend: &mut backend, channels: &mut channels, many };
                     let _ = client_channel.reply(status, &reply[..reply_len], received.badge, &mut others);
                 }
@@ -272,4 +308,34 @@ fn serve_grant(
     }
     // `Reply` copies a transferred capability; the next `GRANT` needs this slot empty.
     let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
+}
+
+/// The newest image in either slot that verifies through the keystore, or `None`.
+fn load(volume: &mut Client, ks_channel: &mut Channel, image: &mut [u8; SLOT_BYTES]) -> Option<(Store, u64)> {
+    let mut best: Option<(Store, u64)> = None;
+    for slot in 0..2 {
+        let read = image
+            .chunks_mut(block::MAX_BYTES)
+            .enumerate()
+            .all(|(i, chunk)| volume.read((slot * SLOT_SECTORS + i * block::MAX_SECTORS) as u64, chunk).is_ok());
+        if !read {
+            continue;
+        }
+        let Ok((store, seq)) = Store::load_image(SELF_CNODE_CPTR, &mut ChannelCipher::new(ks_channel), image) else { continue };
+        if best.as_ref().is_none_or(|(_, newest)| seq > *newest) {
+            best = Some((store, seq));
+        }
+    }
+    best
+}
+
+/// Saves image `seq` to slot `seq % 2`, the one not holding the image before it. `true` once it's all on the disk.
+fn save(volume: &mut Client, store: &Store, ks_channel: &mut Channel, seq: u64, image: &mut [u8; SLOT_BYTES]) -> bool {
+    image.fill(0);
+    let Ok(len) = store.save_image(&mut ChannelCipher::new(ks_channel), seq, image) else { return false };
+    let first = (seq as usize % 2) * SLOT_SECTORS;
+    image[..len.div_ceil(SECTOR) * SECTOR]
+        .chunks(block::MAX_BYTES)
+        .enumerate()
+        .all(|(i, chunk)| volume.write((first + i * block::MAX_SECTORS) as u64, chunk).is_ok())
 }

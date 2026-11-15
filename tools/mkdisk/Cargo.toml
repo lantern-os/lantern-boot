@@ -1,0 +1,15 @@
+[package]
+name = "lantern-mkdisk"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0031's disk-image tool: writes a raw disk with a GPT, a packages partition holding signed .lpkg files behind an index, and an erased store partition. A host program: build it with --target <host triple>, since lantern-boot defaults to riscv64."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-mkdisk"
+path = "src/main.rs"
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main" }

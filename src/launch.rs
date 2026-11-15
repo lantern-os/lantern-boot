@@ -708,6 +708,34 @@ pub fn map_package(
     delete(state, root, frame_cptr);
 }
 
+/// [RFC-0031](../../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md): the first virtio-mmio slot on
+/// QEMU `virt` holding a modern (version 2) block device: its register page's physical address and its interrupt line.
+/// Boot reads only each slot's magic, version and device ID; the driver does everything else.
+#[allow(dead_code)]
+pub fn find_virtio_blk() -> Option<(usize, u16)> {
+    const FIRST: usize = 0x1000_1000;
+    const SLOTS: usize = 8;
+    (0..SLOTS).find_map(|i| {
+        let base = FIRST + i * 0x1000;
+        // SAFETY: QEMU `virt`'s virtio-mmio slots, read in boot's identity-mapped S-mode before any program runs. Reading
+        // these registers has no side effect.
+        let read = |offset: usize| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
+        (read(0) == 0x7472_6976 && read(4) == 2 && read(8) == 2).then_some((base, 1 + i as u16))
+    })
+}
+
+/// Carves `bytes` from `untyped_cptr` into a new `Untyped` at `dest` that boot marks for DMA: a Frame retyped from it
+/// reveals its physical address (RFC-0031). Give it to a driver, and to nothing else.
+#[allow(dead_code)]
+pub fn dma_untyped(state: &mut KernelState, root: TcbId, untyped_cptr: CPtr, dest: CPtr, bytes: usize) {
+    retype_untyped(state, root, untyped_cptr, dest, bytes);
+    let cnode = state.tcbs.get(root.0 as usize).unwrap().cspace.expect("root has a CSpace");
+    let Some(Capability::Untyped { id, .. }) = state.cnodes.get(cnode.0 as usize).unwrap().get(dest) else {
+        panic!("expected an Untyped capability");
+    };
+    state.untypeds.get_mut(id.0 as usize).unwrap().dma = true;
+}
+
 /// [RFC-0029](../../lantern-rfcs/rfcs/0029-a-confined-launcher.md)'s package-set format: each of `entries` in its own
 /// fresh `FrameMega`, its length (8 bytes, little-endian) then its bytes, mapped **read-only** at `vaddr + i × 2 MiB` in
 /// each of `vspaces`, at most two (a Frame's mapping limit). Nobody gets a capability to the Frames, and root drops its

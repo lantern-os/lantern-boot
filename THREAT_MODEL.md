@@ -11,7 +11,7 @@ the foundation of all other guarantees; threats here are top severity (system th
 ## Threats and mitigations
 | # | Threat | Mitigation |
 | --- | --- | --- |
-| B1 | Tampered firmware/loader/kernel image | Verify signatures against a hardware-anchored trust root; refuse unverified images. |
+| B1 | Tampered firmware/loader/kernel image | Verify signatures against a hardware-anchored trust root; refuse unverified images. **Not yet:** since [ADR-0037](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0037-installing-a-bootable-disk.md), the firmware runs the disk's EFI loader, which runs the disk's boot image, and neither is verified. On RFC-0023's checklist. |
 | B2 | Evil-maid / persistence below the OS | Measured boot makes tampering detectable via attestation. |
 | B3 | Rollback to a vulnerable signed version | Monotonic version counters / anti-rollback (hardware dependent). |
 | B4 | Trust-anchor compromise | Keys held in enclave; rotation policy; defence in depth. |

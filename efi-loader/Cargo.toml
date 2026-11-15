@@ -1,0 +1,27 @@
+[package]
+name = "lantern-efi-loader"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0032's EFI loader: a UEFI application that reads LanternOS's boot image from its EFI System Partition, places it where the kernel runs, leaves UEFI, and jumps to it with the contract OpenSBI gives today. Built position-independent, then converted to PE/COFF by tools/elf2efi."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_efi_loader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-efi-loader"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+# UEFI's types and constants only: no code.
+r-efi = { version = "5", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
