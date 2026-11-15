@@ -24,9 +24,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ERASED="$WORK/erased.img"
-IMAGE="$WORK/flash.img"
-head -c 33554432 /dev/zero | tr '\0' '\377' >"$ERASED"
+# RFC-0032: the policy store's log is on the disk too, in its own partition, which `audit-dump` reads.
+POLICY="$WORK/policy.img"
+# RFC-0031: the disk, made from the current packages each boot unless KEEP is set, as the flash is.
+DISK="$WORK/disk.img"
+(cd tools/mkdisk && cargo build -q --target "$(rustc -vV | sed -n 's/^host: //p')") || exit 2
+MKDISK="tools/mkdisk/target/$(rustc -vV | sed -n 's/^host: //p')/debug/lantern-mkdisk"
+# `lantern-mkdisk`'s layout: the store partition's first sector, each image slot's size, and the policy partition's
+# first sector and size, in sectors.
+STORE_SECTOR=34816
+SLOT_SECTORS=32
+POLICY_SECTOR=36864
+POLICY_SECTORS=4096
 (cd "$SDK" && cargo build -q --example resign) || exit 2
 RESIGN="$SDK/target/debug/examples/resign"
 (cd "$SHELL_REPO/policy-store" && cargo build -q --example audit-dump --target x86_64-unknown-linux-gnu) || exit 2
@@ -39,18 +48,40 @@ fail() {
     failures=$((failures + 1))
 }
 
-# boot: builds the image with the current assets, and FEATURES if set, and starts it on $IMAGE, reading the console into
+# boot: builds the image with the current assets, and FEATURES if set, and starts it on $DISK, reading the console into
 # $OUT.
 boot() {
-    [ -n "${KEEP:-}" ] || cp "$ERASED" "$IMAGE"
+    # A new disk unless KEEP is set. With NEW_DISK as well, only the packages are rewritten: the store's files and the
+    # policy store's remembered decisions stay, as they would on a machine given new packages.
+    if [ -z "${KEEP:-}" ]; then
+        "$MKDISK" --out "$DISK" --package assets/probe.lpkg --package assets/fs-probe.lpkg >/dev/null || exit 2
+    elif [ -n "${NEW_DISK:-}" ]; then
+        "$MKDISK" --update --out "$DISK" --package assets/probe.lpkg --package assets/fs-probe.lpkg >/dev/null || exit 2
+    fi
     cargo build -q --release --bin lantern-boot-system ${FEATURES:+--features "$FEATURES"} || exit 2
+    local granted
+    granted=$(grants_recorded)
     rm -f "$WORK/in"
     mkfifo "$WORK/in"
     qemu-system-riscv64 -machine virt -bios default -nographic -m 256M \
-        -drive "if=pflash,format=raw,unit=1,file=$IMAGE" -kernel "$TARGET/lantern-boot-system" <"$WORK/in" >"$OUT" 2>&1 &
+        -global virtio-mmio.force-legacy=false -drive "if=none,format=raw,file=$DISK,id=disk" -device virtio-blk-device,drive=disk \
+        -kernel "$TARGET/lantern-boot-system" <"$WORK/in" >"$OUT" 2>&1 &
     QEMU_PID=$!
     exec 3>"$WORK/in"
     expect 'Type help for commands.'
+    # The policy store reads its partition before it records anything, so this boot's first records reach the disk a
+    # little after the console is up: wait for the keystore's grant to the store, which every boot records.
+    for _ in $(seq 1 100); do
+        [ "$(grants_recorded)" -gt "$granted" ] && return 0
+        sleep 0.1
+    done
+    fail "this boot's first records never reached the disk"
+}
+
+# grants_recorded: how many SERVICE_GRANTED records the disk's audit log holds.
+grants_recorded() {
+    [ -f "$DISK" ] || { echo 0; return; }
+    "$DUMP" "$(policy_image)" 2>/dev/null | awk '$3 == "SERVICE_GRANTED" { n++ } END { print n + 0 }'
 }
 
 # run <app>: asks the launcher to start it, and waits for it to say so.
@@ -91,7 +122,7 @@ type_line() {
 
 # events: this image's audit events, as EVENT or EVENT:REASON, for the last boot only.
 events() {
-    "$DUMP" "$IMAGE" | awk '/^record/ { if ($3 == "BOOT") { s = "" } s = s (s == "" ? "" : " ") $3 ($4 == "-" ? "" : ":" $4) } END { print s }'
+    "$DUMP" "$(policy_image)" | awk '/^record/ { if ($3 == "BOOT") { s = "" } s = s (s == "" ? "" : " ") $3 ($4 == "-" ? "" : ":" $4) } END { print s }'
 }
 
 # audit_is <events>: this boot's events must be exactly these.
@@ -99,6 +130,30 @@ audit_is() {
     local got
     got=$(events)
     [ "$got" = "$1" ] || fail "audit: want \"$1\", got \"$got\""
+}
+
+# store_seqs: each image slot's sequence number on the disk, or "-" for one that isn't an image.
+store_seqs() {
+    python3 - "$DISK" "$STORE_SECTOR" "$SLOT_SECTORS" <<'PY'
+import struct, sys
+disk, first, slot = open(sys.argv[1], 'rb').read(), int(sys.argv[2]), int(sys.argv[3])
+seqs = []
+for i in range(2):
+    at = (first + i * slot) * 512
+    seqs.append(str(struct.unpack_from('<Q', disk, at + 8)[0]) if disk[at:at + 8] == b'LSTORE01' else '-')
+print(' '.join(seqs))
+PY
+}
+
+# policy_image: the disk's policy partition, as a file `audit-dump` reads like the flash it used to be on.
+policy_image() {
+    dd if="$DISK" of="$POLICY" bs=512 skip="$POLICY_SECTOR" count="$POLICY_SECTORS" 2>/dev/null
+    printf '%s' "$POLICY"
+}
+
+# corrupt_slot <n>: flips one byte in image slot n's body, as a torn write or tampering would.
+corrupt_slot() {
+    printf '\x5a' | dd of="$DISK" bs=1 seek=$(( (STORE_SECTOR + $1 * SLOT_SECTORS) * 512 + 100 )) conv=notrunc 2>/dev/null
 }
 
 ok() {
@@ -126,9 +181,9 @@ FS_DONE='lantern: "confined-fs-probe" finished.'
 ENDED='REVOKING:APP_ENDED'
 # Every boot: the keystore grants the store its sealing key, once, as fixed infrastructure (RFC-0029's system profile).
 START='BOOT SERVICE_GRANTED'
-# The filesystem app's run, as the store and the keystore record it: its reads and writes, and the store's own sealing
-# and unsealing of each through its keystore grant.
-FS_USES='USING USING USING USING USING USING USING'
+# The filesystem app's run, as the store and the keystore record it: its reads and writes, the store's own sealing and
+# unsealing of each through its keystore grant, and (RFC-0031) the sealing of the store's image after its write.
+FS_USES='USING USING USING USING USING USING USING USING'
 # The runtime's own checks of its grant, then the guest's SIGN, recorded by the keystore (RFC-0025). A declined grant
 # records none of these, and neither the runtime's self-check `BIND`, which it makes only once granted.
 USES='USING USE_FAILED:ACCESS USING'
@@ -185,7 +240,7 @@ type_line decisions
 expect '0  always  "confined-probe" role "probe-signing"'
 stop
 audit_is "$START CONSENTED:ALWAYS GRANTING GRANTED DECLINED:NOT_DECLARED $USES $ENDED"
-"$DUMP" "$IMAGE" | grep -q '^decision ALLOW ops=0x4' || fail 'no remembered ALLOW on flash'
+"$DUMP" "$(policy_image)" | grep -q '^decision ALLOW ops=0x4' || fail 'no remembered ALLOW on the disk'
 ok
 
 case_ 'always: no prompt next boot'
@@ -199,7 +254,7 @@ ok
 
 case_ 'always, then the app asks beyond the ceiling'
 resign "$(printf '[app]\nname = "confined-probe"\nversion = "0.1.0"\n\n[[keystore.key]]\nrole = "probe-signing"\nops = ["sign", "encrypt"]\njustification = "x"\n')"
-KEEP=1 boot
+KEEP=1 NEW_DISK=1 boot
 run confined-probe
 expect "$FAILED"
 grep -aqF "$PROMPT" "$OUT" && fail 'asked about a request outside the ceiling'
@@ -210,14 +265,14 @@ ok
 
 # The `launcher-hold-test` feature keeps an ended app, and its grants, resident.
 case_ 'revoke at the console forgets always'
-FEATURES=launcher-hold-test KEEP=1 boot
+FEATURES=launcher-hold-test KEEP=1 NEW_DISK=1 boot
 run confined-probe
 expect "$DONE" && type_line grants && expect '0  "confined-probe" keystore role "probe-signing": sign'
 type_line 'revoke 0' && expect 'lantern: grant 0: revoked'
 type_line grants
 expect '(revoked)'
 stop
-"$DUMP" "$IMAGE" | grep -q '^decision' && fail 'the "always" is still remembered'
+"$DUMP" "$(policy_image)" | grep -q '^decision' && fail 'the "always" is still remembered'
 ok
 
 case_ 'revoked: asked again next boot'
@@ -338,6 +393,49 @@ grep -aqF 'confined-fs-probe      ' "$OUT" && fail 'a tampered package was liste
 stop
 restore
 audit_is "$START"
+ok
+
+# RFC-0031: the store keeps its files on the disk, as a sealed image in one of two slots.
+case_ 'a file outlives a reboot'
+boot
+run confined-fs-probe
+expect "$PROMPT" && type_line a && expect "$FS_DONE"
+stop
+[ "$(store_seqs)" = '- 1' ] || fail "after one write, want slots '- 1', got '$(store_seqs)'"
+KEEP=1 boot
+run confined-fs-probe && expect "$FS_DONE"
+stop
+# Image 2 follows image 1 only if the store loaded image 1 at start.
+[ "$(store_seqs)" = '2 1' ] || fail "after a reboot, want slots '2 1', got '$(store_seqs)'"
+ok
+
+case_ 'a torn newest image falls back to the one before'
+corrupt_slot 0
+KEEP=1 boot
+run confined-fs-probe && expect "$FS_DONE"
+stop
+# Image 2 was refused, so the store went on from image 1, and wrote image 2 again where it was.
+[ "$(store_seqs)" = '2 1' ] || fail "want slots '2 1', got '$(store_seqs)'"
+ok
+
+case_ 'a store with no image that verifies starts empty'
+corrupt_slot 0
+corrupt_slot 1
+KEEP=1 boot
+run confined-fs-probe && expect "$FS_DONE"
+stop
+# Slot 0's header still reads 2, but its body doesn't verify: had the store taken it, the next image would be 3, in slot 1.
+[ "$(store_seqs | cut -d' ' -f2)" = 1 ] || fail "starting over, want image 1 in slot 1, got '$(store_seqs)'"
+ok
+
+case_ 'a tampered package on the disk is neither listed nor run'
+boot
+stop
+printf '\x5a' | dd of="$DISK" bs=1 seek=$(( 2048 * 512 + 512 + 4096 )) conv=notrunc 2>/dev/null
+KEEP=1 boot
+type_line apps && expect '  confined-fs-probe '
+type_line 'run confined-probe' && expect 'lantern: there'"'"'s no app called "confined-probe"; type apps.'
+stop
 ok
 
 # RFC-0028: a request has a limit. The `consent-limit-test` feature lowers it from 60 s to 2 s.

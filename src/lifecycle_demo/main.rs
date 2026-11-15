@@ -58,6 +58,11 @@ fn lifecycle_demo_trap_handler(frame: &mut TrapFrame) {
             _ => return,
         };
         println!("lifecycle-demo: nursery Signal'd {which} -- ok={} a={} b={}", !frame.tag().is_error(), incoming[1], incoming[2]);
+        println!(
+            "lifecycle-demo: the kernel used at most {} of its {} bytes of trap stack",
+            lantern_hal::riscv64_trap_stack_high_water(),
+            lantern_hal::RISCV64_TRAP_STACK_BYTES
+        );
     }
 }
 

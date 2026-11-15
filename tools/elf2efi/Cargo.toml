@@ -1,0 +1,15 @@
+[package]
+name = "lantern-elf2efi"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0032's ELF-to-PE tool: turns the position-independent riscv64 EFI loader into the PE/COFF image UEFI loads, with its base relocations. Rust has no RISC-V UEFI target. A host program: build it with --target <host triple>, since lantern-boot defaults to riscv64."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_elf2efi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-elf2efi"
+path = "src/main.rs"

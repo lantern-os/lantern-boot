@@ -1,0 +1,27 @@
+[package]
+name = "lantern-volume"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0031's volume: a confined riscv64 program, the block driver's one client, that reads the disk's GPT and serves each client exactly its own partition. No DMA, no mint authority. Loaded by lantern-boot's system image."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_volume"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-volume"
+path = "src/main.rs"
+# Bare-metal riscv64 only: there is no `test` crate for this target.
+test = false
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

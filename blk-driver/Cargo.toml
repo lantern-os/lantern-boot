@@ -1,0 +1,21 @@
+[package]
+name = "lantern-blk-driver"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0031's virtio-blk driver: a confined riscv64 program holding one virtio-mmio device's 4 KiB register page, its IrqHandler, and a DMA Untyped for its queue. It serves raw sectors to one client, the volume, and parses nothing from the disk. Loaded by lantern-boot's system image."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-blk-driver"
+path = "src/main.rs"
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

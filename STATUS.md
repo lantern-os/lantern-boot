@@ -527,6 +527,41 @@
     - 7 runs across 4 slots, each grant ending with its app;
     - with the `launcher-hold-test` feature, four apps at once, their grants in `grants`, and "no room" for a fifth;
     - a tampered package that's neither listed nor run.
+- **Storage (2026-11-14, [RFC-0031](../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md)/[ADR-0036](../lantern-rfcs/adr/0036-storage-a-block-driver-and-the-store-on-disk.md)).** Two new confined programs in the system image:
+  - **`blk-driver`**: virtio-blk over modern virtio-mmio, with DMA from a 2 MiB DMA `Untyped`. It parses nothing from the
+    disk and is trusted with memory, since there's no IOMMU.
+  - **`volume`**: reads the GPT and serves each client its partition, with every sector checked (`lantern_volume::route`,
+    2 tests).
+
+  Other changes:
+  - **`store-service`** gains `ON_DISK`: two image slots, the newest that verifies loaded at start, and each write saved
+    before it's answered `OK`.
+  - **`tools/mkdisk`** (`lantern-mkdisk`) writes the disk, and `fdisk` reads its GPT.
+  - **Boot** finds the device by probing the virtio-mmio slots, and the system image needs a disk and
+    `-global virtio-mmio.force-legacy=false`.
+  - **`console-matrix.sh`: 25 cases**, each with a disk. New ones:
+    - a file outlives a reboot;
+    - a torn newest image falls back to the one before;
+    - a store with no image that verifies starts empty;
+    - a tampered package on the disk is neither listed nor run.
+
+  Mutation-tested: a volume without its range check, a store image loaded without its seal or its digest, a kernel that
+  gives any Frame's address, and a store that answers before saving.
+- **Installing: LanternOS boots from its disk (2026-11-14, [RFC-0032](../lantern-rfcs/rfcs/0032-installing-a-bootable-disk.md)/[ADR-0037](../lantern-rfcs/adr/0037-installing-a-bootable-disk.md)).**
+  - **`efi-loader`:** a UEFI application that places `\LANTERN\BOOT.ELF` at `0x8020_0000` and jumps to it, with
+    OpenSBI's contract. `lib.rs` holds the placement and its checks, with 2 tests.
+  - **`tools/elf2efi`:** position-independent ELF to PE32+, with base relocations (2 tests).
+  - **`tools/mkdisk`:**
+    - `--bootable` adds an EFI System Partition, written by its own FAT16 writer with long names (2 tests; `fsck.fat`
+      passes it).
+    - Every disk gets a policy partition.
+    - `--update` rewrites only the packages.
+  - **The system image:** its policy store is on the disk.
+  - **`scripts/make-image.sh`** builds an installable `lantern.img`.
+  - **`scripts/boot-disk.sh`:** EDK2 boots it with no `-kernel`, and a reboot keeps both a remembered decision and a
+    file.
+  - **`console-matrix.sh`:** 25 cases, now with the audit log read from the disk, and each boot waiting for its first
+    records to reach it.
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.

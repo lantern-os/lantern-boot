@@ -1,0 +1,7 @@
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+# Position-independent, so UEFI can load it anywhere: tools/elf2efi turns its R_RISCV_RELATIVE relocations into PE base
+# relocations.
+rustflags = ["-C", "relocation-model=pie", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-znorelro", "-C", "link-arg=-Tlinker.ld"]
