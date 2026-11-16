@@ -1,0 +1,27 @@
+[package]
+name = "lantern-inference-service"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0034's inference service: a confined U-mode program that reads its model from the disk's model partition through the volume, checks it against the digest it was built with, and serves GENERATE to the grants the launch binder made, recording each call in the audit log before it runs. Built on lantern-abi, lantern-crypto (BLAKE3) and lantern-ai-runtime -- nothing from the TCB."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_inference_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-inference-service"
+path = "src/main.rs"
+
+[dependencies]
+# Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/..."` when pushing lantern-boot standalone.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+lantern-ai-runtime = { git = "https://github.com/lantern-os/lantern-ai-runtime", branch = "main" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

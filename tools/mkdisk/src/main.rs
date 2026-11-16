@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! lantern-mkdisk --out <disk.img> [--size-mib <n>] --package <a.lpkg> [--package <b.lpkg> ...]
-//!                [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>]
+//!                [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>] [--model <m.lmodel>]
 //! ```
 //!
 //! Writes a raw image: a GPT (`lantern_abi::gpt`) with partitions each aligned to 1 MiB:
@@ -12,10 +12,16 @@
 //!   System Partition**, 32 MiB, FAT16 (`fat`), holding `\EFI\BOOT\BOOTRISCV64.EFI` and `\LANTERN\BOOT.ELF`;
 //! - **packages**, 16 MiB: an index sector (`lantern_abi::block::packages`), then each package from a sector boundary;
 //! - **store**, 1 MiB, zeroed, so the store starts empty;
-//! - the **policy store's** log, 2 MiB of `0xFF`, which is erased flash to it.
+//! - the **policy store's** log, 2 MiB of `0xFF`, which is erased flash to it;
+//! - the **wallet's** partition, 1 MiB, zeroed, so the wallet makes its root on first start
+//!   ([RFC-0035](../../../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md));
+//! - with `--model` ([RFC-0034](../../../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md)), the
+//!   **model**, 32 MiB: an `LMODEL01` file from `lantern-mkmodel`, which the inference service checks against the digest
+//!   it was built with. A disk is 128 MiB unless `--size-mib` says otherwise.
 //!
 //! `--update` rewrites only the packages partition of the disk at `--out`, and leaves everything else on it, including the
-//! store's files and the policy store's log: how a disk gets new packages without losing what's on it.
+//! store's files and the policy store's log: how a disk gets new packages without losing what's on it. With `--model`, it
+//! rewrites the model partition too, on a disk that has one.
 //!
 //! A bootable image is what installing means for now: a VM uses it as its disk, and a machine has it written to its own.
 //!
@@ -35,6 +41,8 @@ const STORE_SECTORS: u64 = ALIGN;
 const ESP_SECTORS: u64 = 32 * ALIGN;
 /// The policy store's 8 sectors of 256 KiB, as on flash.
 const POLICY_SECTORS: u64 = 2 * ALIGN;
+const MODELS_SECTORS: u64 = 32 * ALIGN;
+const WALLET_SECTORS: u64 = ALIGN;
 /// Each package must fit, with its length, in the 2 MiB a reader keeps it in (`lantern_abi::launcher::SET_STRIDE`).
 const PACKAGE_MAX: usize = lantern_abi::launcher::SET_STRIDE - lantern_abi::launcher::SET_HEADER;
 
@@ -50,8 +58,9 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let usage = "lantern-mkdisk --out <disk.img> [--size-mib <n>] --package <a.lpkg> [--package <b.lpkg> ...] \
-                 [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>] [--update]";
-    let (mut out, mut size_mib, mut paths, mut bootable, mut loader, mut boot_image) = (None, 64u64, Vec::new(), false, None, None);
+                 [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>] [--model <m.lmodel>] [--update]";
+    let (mut out, mut size_mib, mut paths, mut bootable, mut loader, mut boot_image) = (None, None, Vec::new(), false, None, None);
+    let mut model = None;
     let mut update = false;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -63,7 +72,8 @@ fn run() -> Result<(), String> {
         let value = args.next().ok_or(usage)?;
         match flag.as_str() {
             "--out" => out = Some(value),
-            "--size-mib" => size_mib = value.parse().map_err(|_| "--size-mib must be a number")?,
+            "--size-mib" => size_mib = Some(value.parse::<u64>().map_err(|_| "--size-mib must be a number")?),
+            "--model" => model = Some(value),
             "--package" => paths.push(value),
             "--loader" => loader = Some(value),
             "--boot-image" => boot_image = Some(value),
@@ -77,9 +87,14 @@ fn run() -> Result<(), String> {
     if paths.len() > packages::MAX {
         return Err(format!("at most {} packages", packages::MAX));
     }
-    if update {
-        return update_packages(&out, &paths);
+    let model = model.map(|p| std::fs::read(&p).map_err(|e| format!("{p}: {e}"))).transpose()?;
+    if model.as_ref().is_some_and(|m| m.len() as u64 > MODELS_SECTORS * SECTOR as u64) {
+        return Err("the model doesn't fit its 32 MiB partition".into());
     }
+    if update {
+        return update_packages(&out, &paths, model.as_deref());
+    }
+    let size_mib = size_mib.unwrap_or(128);
     let sectors = size_mib * MIB / SECTOR as u64;
     let esp = Extent { first: ALIGN, sectors: ESP_SECTORS };
     let packages = Extent { first: if bootable { esp.first + esp.sectors } else { ALIGN }, sectors: PACKAGES_SECTORS };
@@ -90,6 +105,13 @@ fn run() -> Result<(), String> {
         (gpt::STORE_TYPE, store, "lantern-store"),
         (gpt::POLICY_TYPE, policy, "lantern-policy"),
     ];
+    // After every partition there was before it, so the others stay where they were.
+    let models = Extent { first: policy.first + policy.sectors, sectors: MODELS_SECTORS };
+    let wallet = Extent { first: models.first + models.sectors, sectors: WALLET_SECTORS };
+    partitions.push((gpt::WALLET_TYPE, wallet, "lantern-wallet"));
+    if model.is_some() {
+        partitions.push((gpt::MODELS_TYPE, models, "lantern-models"));
+    }
     if bootable {
         partitions.insert(0, (gpt::ESP_TYPE, esp, "EFI system partition"));
     }
@@ -110,14 +132,18 @@ fn run() -> Result<(), String> {
     }
     disk[range(policy)].fill(0xff);
     write_packages(&mut disk[range(packages)], &paths)?;
+    if let Some(model) = &model {
+        disk[range(models)][..model.len()].copy_from_slice(model);
+    }
     std::fs::write(&out, &disk).map_err(|e| format!("{out}: {e}"))?;
     let boot = if bootable { ", bootable" } else { "" };
-    println!("lantern-mkdisk: {out}: {size_mib} MiB, {} package(s), an empty store{boot}", paths.len());
+    let with_model = if model.is_some() { ", a model" } else { "" };
+    println!("lantern-mkdisk: {out}: {size_mib} MiB, {} package(s), an empty store{with_model}{boot}", paths.len());
     Ok(())
 }
 
 /// `--update`: the disk's own packages partition, from its GPT, rewritten with `paths`.
-fn update_packages(out: &str, paths: &[String]) -> Result<(), String> {
+fn update_packages(out: &str, paths: &[String], model: Option<&[u8]>) -> Result<(), String> {
     let mut disk = std::fs::read(out).map_err(|e| format!("{out}: {e}"))?;
     let at = |lba: u64| lba as usize * SECTOR;
     let header = disk.get(at(gpt::HEADER_LBA)..at(gpt::HEADER_LBA + 1)).ok_or("not a disk")?;
@@ -125,6 +151,12 @@ fn update_packages(out: &str, paths: &[String]) -> Result<(), String> {
     let layout = gpt::parse(header, entries, (disk.len() / SECTOR) as u64).ok_or(format!("{out}: no LanternOS GPT"))?;
     let packages = layout.packages;
     write_packages(&mut disk[at(packages.first)..at(packages.first + packages.sectors)], paths)?;
+    if let Some(model) = model {
+        let models = layout.models.ok_or(format!("{out}: has no model partition; write a new disk with --model"))?;
+        let partition = &mut disk[at(models.first)..at(models.first + models.sectors)];
+        partition.fill(0);
+        partition.get_mut(..model.len()).ok_or("the model doesn't fit the disk's model partition")?.copy_from_slice(model);
+    }
     std::fs::write(out, &disk).map_err(|e| format!("{out}: {e}"))?;
     println!("lantern-mkdisk: {out}: {} package(s) written, everything else kept", paths.len());
     Ok(())

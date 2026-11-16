@@ -205,6 +205,9 @@ pub const READER_BADGE: u64 = (1 << 56) - 1;
 pub const KEYSTORE_WRITER_BADGE: u64 = READER_BADGE - 1;
 #[allow(dead_code)]
 pub const STORE_WRITER_BADGE: u64 = READER_BADGE - 2;
+/// `lantern_abi::policy::INFERENCE_WRITER_BADGE` (RFC-0034).
+#[allow(dead_code)]
+pub const INFERENCE_WRITER_BADGE: u64 = READER_BADGE - 3;
 /// Where an audited service finds that capability: `keystore-service`'s and `store-service`'s `AUDIT_CPTR`.
 #[allow(dead_code)]
 pub const SERVICE_AUDIT_CPTR: CPtr = 5;
@@ -713,6 +716,13 @@ pub fn map_package(
 /// Boot reads only each slot's magic, version and device ID; the driver does everything else.
 #[allow(dead_code)]
 pub fn find_virtio_blk() -> Option<(usize, u16)> {
+    find_virtio(2)
+}
+
+/// As [`find_virtio_blk`], for any virtio device ID: 1 for a network card, 4 for a random-number generator
+/// ([RFC-0035](../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md)).
+#[allow(dead_code)]
+pub fn find_virtio(device_id: u32) -> Option<(usize, u16)> {
     const FIRST: usize = 0x1000_1000;
     const SLOTS: usize = 8;
     (0..SLOTS).find_map(|i| {
@@ -720,7 +730,7 @@ pub fn find_virtio_blk() -> Option<(usize, u16)> {
         // SAFETY: QEMU `virt`'s virtio-mmio slots, read in boot's identity-mapped S-mode before any program runs. Reading
         // these registers has no side effect.
         let read = |offset: usize| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
-        (read(0) == 0x7472_6976 && read(4) == 2 && read(8) == 2).then_some((base, 1 + i as u16))
+        (read(0) == 0x7472_6976 && read(4) == 2 && read(8) == device_id).then_some((base, 1 + i as u16))
     })
 }
 

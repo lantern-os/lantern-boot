@@ -7,6 +7,8 @@
 //! | `LAUNCHER`, `BINDER` | packages | read |
 //! | `STORE` | store | read and write |
 //! | `POLICY` | policy store's log | read and write |
+//! | `WALLET` | the wallet's sealed root ([RFC-0035](../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md)) | read and write |
+//! | `MODELS` | the model ([RFC-0034](../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md)) | read |
 //!
 //! A client names sectors from its partition's start, checked against its length, so it can't name one outside it. The
 //! partition table is untrusted: it's parsed here (`lantern_abi::gpt`), in a program with no DMA and no mint authority,

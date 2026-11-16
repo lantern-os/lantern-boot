@@ -16,6 +16,7 @@ the foundation of all other guarantees; threats here are top severity (system th
 | B3 | Rollback to a vulnerable signed version | Monotonic version counters / anti-rollback (hardware dependent). |
 | B4 | Trust-anchor compromise | Keys held in enclave; rotation policy; defence in depth. |
 | B5 | Attestation abused as a tracker | Mediate who can request attestation; minimise linkable detail ([Identity](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Identity.md)). |
+| B6 | A model on the disk that isn't the one the system was built with ([RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md)) | `inference-service` checks the whole file's BLAKE3 digest against `assets/model.digest`, compiled in, before parsing it, and refuses every call otherwise. **Not yet:** the digest lives in the boot image, which B1 says nothing verifies, so whoever can rewrite the disk can replace both. On RFC-0023's checklist. |
 
 ## Non-goals
 - Defeating a malicious hardware root of trust or implanted silicon (system non-goal).

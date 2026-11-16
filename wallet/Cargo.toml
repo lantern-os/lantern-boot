@@ -1,0 +1,26 @@
+[package]
+name = "lantern-wallet"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0035's wallet: one secret root, a pairwise identity per (app, peer) derived from it, and Noise XX sessions as that identity over the net service. Apps get sessions, never keys. Confined; nothing from the TCB."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_wallet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-wallet"
+path = "src/main.rs"
+
+[dependencies]
+# Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/..."` when pushing lantern-boot standalone.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

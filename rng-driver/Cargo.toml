@@ -1,0 +1,23 @@
+[package]
+name = "lantern-rng-driver"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0035's virtio-rng driver: random bytes from the device, served to one client, the wallet. Confined; trusted with memory until there's an IOMMU, as every DMA driver is."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-rng-driver"
+path = "src/main.rs"
+
+[dependencies]
+# Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/lantern-abi"` when pushing lantern-boot
+# standalone.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-virtio = { path = "../virtio" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

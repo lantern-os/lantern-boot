@@ -1,0 +1,14 @@
+[package]
+name = "lantern-peer"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0035's test peer: a host program that answers the wallet's Noise XX handshakes over UDP with snow, an independent implementation, and logs each identity it sees. A host program: build it with --target <host triple>, since lantern-boot defaults to riscv64."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-peer"
+path = "src/main.rs"
+
+[dependencies]
+snow = "0.9"
