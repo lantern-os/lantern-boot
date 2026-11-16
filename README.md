@@ -7,9 +7,10 @@ first confined programs from their ELF images, hands each exactly the capabiliti
 - **Language:** Rust.
 - **System context:** [wiki/Hardware](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Hardware.md), [wiki/Security](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Security.md).
 
-> **Phase 3**, on QEMU `virt` (riscv64). The interactive system boots from its own disk through UEFI: see
+> **Phase 4** ([RFC-0036](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0036-phase-3-to-phase-4-transition.md)): hardware and assurance. The interactive system boots from its own disk through UEFI on QEMU `virt` (riscv64): see
 > [`STATUS.md`](./STATUS.md). It is a research system: its keys are public demo keys, and nothing below the kernel is
-> verified yet ([RFC-0023](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0023-hardware-key-custody-in-phase-4.md)'s checklist).
+> verified yet ([RFC-0023](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0023-hardware-key-custody-in-phase-4.md)'s checklist). Real hardware is
+> Phase 4's bring-up.
 
 ## Run LanternOS
 
