@@ -1,0 +1,11 @@
+[package]
+name = "lantern-virtio"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0035's shared virtio-mmio plumbing for the confined net and rng drivers: register access, the device handshake, and split virtqueues in a DMA page. (blk-driver keeps its own, older copy.)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_virtio"
+path = "src/lib.rs"

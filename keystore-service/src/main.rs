@@ -95,19 +95,30 @@ const DEMO_SIGNING_SEED: [u8; 32] = [0x24; 32];
 const PROFILE_AEAD: usize = 0;
 const PROFILE_SIGNING: usize = 1;
 const PROFILE_SYSTEM: usize = 2;
-/// With [`PROFILE_SYSTEM`]: one channel per app slot, then the store's.
-const CHANNELS: usize = grant::APP_SLOTS + 1;
+/// With [`PROFILE_SYSTEM`]: one channel per app slot, then the store's, then the wallet's.
+const CHANNELS: usize = grant::APP_SLOTS + 2;
 const STORE_CHANNEL: u8 = grant::APP_SLOTS as u8;
+/// [RFC-0035](../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md): the wallet seals its root under a key of its
+/// own, granted once to whoever calls under this badge, which only the wallet holds.
+const WALLET_CHANNEL: u8 = grant::APP_SLOTS as u8 + 1;
+const WALLET_BADGE: u64 = lantern_abi::identity::KEYSTORE_BADGE;
+/// Demo-only, as [`DEMO_AEAD_SEED`]: the wallet's sealing key.
+const DEMO_WALLET_SEED: [u8; 32] = [0x57; 32];
 const CHANNEL_STRIDE: usize = 0x1000;
 /// Live grants with a channel. Matches `lantern_crypto`'s own grant capacity.
 const MAPPED_GRANTS: usize = 32;
 /// The profile is `arg0`'s low byte; every flag (`grant::BINDER_LAUNCHED`, `grant::AUDITED`) is above it.
 const PROFILE_MASK: usize = 0xff;
 
-/// Large enough for this demo's small ENCRYPT/DECRYPT payloads; a real
-/// service sizes this per its own worst-case reassembled argument
-/// (RFC-0019's "a fixed maximum reassembled argument size per op").
-const REQUEST_CAP: usize = 256;
+/// The largest reassembled argument served (RFC-0019's "a fixed maximum reassembled argument size per op"): the store's
+/// ENCRYPT or DECRYPT of a full block, 256 bytes, with its nonce, its 32-byte AAD, a tag and their length prefixes.
+///
+/// It was 256, which fit the probes' small payloads but not a full block: the store refused every file over about 190
+/// bytes, though it promises 256 ([RFC-0034](../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md) found
+/// it, when the file assistant first wrote a long answer).
+const REQUEST_CAP: usize = BLOCK_MAX + 4 + lantern_crypto::aead::NONCE_LEN + 4 + lantern_crypto::hash::HASH_LEN + 4 + lantern_crypto::aead::TAG_LEN;
+/// `lantern_filesystem::MAX_BLOCK_LEN`, which this crate doesn't link.
+const BLOCK_MAX: usize = 256;
 
 fn run(arg0: usize) -> ! {
     let mut keystore = Keystore::new(SELF_CNODE_CPTR);
@@ -127,34 +138,24 @@ fn run(arg0: usize) -> ! {
     let mut backend = Abi;
     let audited = arg0 & grant::AUDITED != 0;
 
+    // With the system profile, the wallet's sealing key, after the store's (RFC-0035).
+    let wallet_key = system.then(|| keystore.generate_aead_key(DEMO_WALLET_SEED).unwrap());
+    let mut wallet_granted = false;
+    let aead = KeyOps::ENCRYPT.union(KeyOps::DECRYPT);
+
     // Phase 1: one client Call's, registering its own reply-leg destination;
-    // grant it `ops` on the one demo key. With the system profile, that client is the store.
+    // grant it `ops` on the one demo key. With the system profile, that client is the store. The wallet may call first:
+    // its badge says it's the wallet, and it gets its own key, not the store's.
     if arg0 & grant::BINDER_LAUNCHED == 0 || system {
-        let _ = sys::recv(ENDPOINT_CPTR);
-        // Recorded after minting, since the badge is the record, and before delivering: an unrecorded
-        // grant never reaches its holder. It is withdrawn instead, and the caller told, and this service
-        // goes on serving, refusing everything, rather than stopping every program with it.
-        let minted = keystore.request_key_access(&mut backend, key, ops, ENDPOINT_CPTR, SCRATCH_CPTR).ok();
-        let recorded = minted.filter(|&badge| {
-            let entry = AuditEntry {
-                event: event::SERVICE_GRANTED,
-                object: key.raw(),
-                ops: ops.bits(),
-                subject: [badge, 0],
-                ..AuditEntry::default()
-            };
-            !audited || policy::append(AUDIT_CPTR, &entry) == Ok(status::OK)
-        });
-        let recorded = recorded.filter(|&badge| !system || channels.bind(badge, STORE_CHANNEL, |_| false));
-        let delivered = recorded.is_some_and(|_| keystore.deliver_grant_via_reply(&mut backend, SCRATCH_CPTR, (0, 0)).is_ok());
-        if !delivered {
-            if let Some(badge) = minted {
-                let _ = keystore.revoke_access(badge);
+        loop {
+            let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
+            if let (Some(wallet_key), WALLET_BADGE, false) = (wallet_key, received.badge, wallet_granted) {
+                wallet_granted = fixed_grant(&mut keystore, &mut backend, &mut channels, wallet_key, aead, WALLET_CHANNEL, audited);
+                continue;
             }
-            let _ = grant::reply_status(status::FAILED);
+            fixed_grant(&mut keystore, &mut backend, &mut channels, key, ops, if system { STORE_CHANNEL } else { 0 }, audited);
+            break;
         }
-        // `Reply` copies a transferred capability; a later `GRANT` needs this slot empty.
-        let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
     }
 
     // Phase 2: serve RFC-0019 wire requests on the same endpoint — the
@@ -170,6 +171,12 @@ fn run(arg0: usize) -> ! {
         core::array::from_fn(|c| unsafe { Channel::new(ENDPOINT_CPTR, (FRAME_VADDR + c * CHANNEL_STRIDE) as *mut u8) });
     loop {
         let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
+        if let (Some(wallet_key), WALLET_BADGE, false) = (wallet_key, received.badge, wallet_granted) {
+            if received.tag.extra_caps == 2 {
+                wallet_granted = fixed_grant(&mut keystore, &mut backend, &mut channels, wallet_key, aead, WALLET_CHANNEL, audited);
+                continue;
+            }
+        }
         match grant::classify(&received) {
             Incoming::Data => {
                 let Some(channel) = (if system { channels.channel_for(received.badge) } else { Some(0) }) else {
@@ -208,6 +215,42 @@ fn run(arg0: usize) -> ! {
     }
 }
 
+/// A fixed infrastructure grant, to the caller now waiting on this program: `ops` on `key`, tied to `channel`. Recorded
+/// after minting, since the badge is the record, and before delivering: an unrecorded grant never reaches its holder. It's
+/// withdrawn instead, and the caller told, and this service goes on serving. `true` if delivered.
+fn fixed_grant(
+    keystore: &mut Keystore,
+    backend: &mut Abi,
+    channels: &mut ChannelMap<MAPPED_GRANTS>,
+    key: KeyId,
+    ops: KeyOps,
+    channel: u8,
+    audited: bool,
+) -> bool {
+    let minted = keystore.request_key_access(backend, key, ops, ENDPOINT_CPTR, SCRATCH_CPTR).ok();
+    let recorded = minted.filter(|&badge| {
+        let entry = AuditEntry {
+            event: event::SERVICE_GRANTED,
+            object: key.raw(),
+            ops: ops.bits(),
+            subject: [badge, 0],
+            ..AuditEntry::default()
+        };
+        !audited || policy::append(AUDIT_CPTR, &entry) == Ok(status::OK)
+    });
+    let recorded = recorded.filter(|&badge| channels.bind(badge, channel, |_| false));
+    let delivered = recorded.is_some_and(|_| keystore.deliver_grant_via_reply(backend, SCRATCH_CPTR, (0, 0)).is_ok());
+    if !delivered {
+        if let Some(badge) = minted {
+            let _ = keystore.revoke_access(badge);
+        }
+        let _ = grant::reply_status(status::FAILED);
+    }
+    // `Reply` copies a transferred capability; a later `GRANT` needs this slot empty.
+    let _ = sys::cnode::delete(SELF_CNODE_CPTR, SCRATCH_CPTR);
+    delivered
+}
+
 /// Everything that isn't the data client: served the same way whether this program is idle or
 /// waiting on a client's next chunk (RFC-0021). All of it stays off the shared `Frame`.
 struct Others<'a> {
@@ -220,7 +263,7 @@ struct Others<'a> {
 impl Interloper for Others<'_> {
     fn serve(&mut self, received: Received) {
         match grant::classify(&received) {
-            Incoming::Grant { object, ops, channel } => {
+            Incoming::Grant { object, ops, channel, .. } => {
                 // With the system profile, every grant is for an app slot's channel, which the binder names.
                 let channel = match (self.system, channel) {
                     (false, _) => None,

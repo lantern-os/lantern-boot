@@ -2,7 +2,7 @@
 //! boot image that is a system rather than a demo. A person decides each grant at a console only the shell can reach, and
 //! since [RFC-0029](../../../lantern-rfcs/rfcs/0029-a-confined-launcher.md), runs the apps they choose there.
 //!
-//! Eight confined programs, and no app until a person asks:
+//! Thirteen confined programs, and no app until a person asks:
 //!
 //! - **`lantern-shell/shell/`** holds the UART's 4 KiB page and its `IrqHandler`, so it is the only program that can
 //!   read or write the console. It also holds the binder's control capability, the audit log's read-only one, one
@@ -25,7 +25,18 @@
 //! - **`blk-driver`**, the virtio-blk device's driver: its register page, its line, and a DMA `Untyped`. Trusted with all
 //!   memory, since QEMU `virt` has no IOMMU; it parses nothing from the disk, and serves only the volume.
 //! - **`volume`**, which reads the disk's GPT and serves each client its own partition: the packages, read-only, to the
-//!   launcher and the binder, which each read and verify them; the store's to the store.
+//!   launcher and the binder, which each read and verify them; the store's to the store; the model's, read-only, to the
+//!   inference service.
+//! - **`inference-service`** ([RFC-0034](../../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md)):
+//!   the language model, read from the disk's model partition into its heap and checked against the digest it was built
+//!   with, served only to the binder's grants, each call recorded first. One channel per app slot. Its 24 MiB heap fits in
+//!   the image's `-m 256M` beside the apps' memory.
+//! - **`rng-driver`**, **`net-driver`**, **`net`** and **`wallet`**
+//!   ([RFC-0035](../../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md)): randomness, a network card, a UDP stack
+//!   that holds no key, and the wallet, which holds every identity's key and presents each app's pairwise identity to a
+//!   peer over an encrypted session. Without `-device virtio-rng-device` and
+//!   `-netdev user,id=net -device virtio-net-device,netdev=net`, the drivers refuse every request, and the wallet every
+//!   session; nothing else changes.
 //!
 //! **This image needs a disk** from `lantern-mkdisk`, as virtio-blk on virtio-mmio, modern:
 //! `-global virtio-mmio.force-legacy=false -drive if=none,format=raw,file=<disk.img>,id=disk -device virtio-blk-device,drive=disk`.
@@ -52,6 +63,11 @@ const POLICY_STORE_ELF: &[u8] = include_bytes!("../../assets/policy-store.elf");
 const SHELL_ELF: &[u8] = include_bytes!("../../assets/shell.elf");
 const BLK_DRIVER_ELF: &[u8] = include_bytes!("../../assets/blk-driver.elf");
 const VOLUME_ELF: &[u8] = include_bytes!("../../assets/volume.elf");
+const INFERENCE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/inference-service.elf");
+const RNG_DRIVER_ELF: &[u8] = include_bytes!("../../assets/rng-driver.elf");
+const NET_DRIVER_ELF: &[u8] = include_bytes!("../../assets/net-driver.elf");
+const NET_ELF: &[u8] = include_bytes!("../../assets/net.elf");
+const WALLET_ELF: &[u8] = include_bytes!("../../assets/wallet.elf");
 
 /// `blk-driver/src/main.rs`'s and `volume/src/main.rs`'s slots, and their channels.
 const DRIVER_ENDPOINT: CPtr = 1;
@@ -73,6 +89,8 @@ const VOLUME_BADGE_LAUNCHER: u64 = 1;
 const VOLUME_BADGE_STORE: u64 = 2;
 const VOLUME_BADGE_BINDER: u64 = 3;
 const VOLUME_BADGE_POLICY: u64 = 4;
+const VOLUME_BADGE_MODELS: u64 = 5;
+const VOLUME_BADGE_WALLET: u64 = 6;
 /// `policy-store`'s `ON_DISK`, its volume slot and channel, and the heap megapage it mirrors its partition in.
 const POLICY_STORE_ON_DISK: usize = 1 << 20;
 const POLICY_STORE_VOLUME: CPtr = 5;
@@ -105,6 +123,75 @@ const STORE_SELF_CNODE_CPTR: CPtr = 0;
 const ARG0_STORE: usize = 1;
 const STORE_KS_FRAME_VADDR: usize = 0x9000_0000;
 const STORE_CLIENT_FRAME_VADDR: usize = 0x9001_0000;
+/// `inference-service`'s slots, addresses and `arg0` (RFC-0034): its heap holds the model and the engine's buffers.
+const INFERENCE_SELF_CNODE: CPtr = 0;
+const INFERENCE_ENDPOINT: CPtr = 1;
+const INFERENCE_AUDIT: CPtr = 3;
+const INFERENCE_VOLUME: CPtr = 4;
+const INFERENCE_FAILURE: CPtr = 5;
+const INFERENCE_CLIENT_VADDR: usize = 0x9001_0000;
+const INFERENCE_VOLUME_VADDR: usize = 0x9002_0000;
+/// 12 × 2 MiB: the 17.5 MB model, its 3.5 MB of attention cache and the rest of the engine's buffers, with room to spare.
+const INFERENCE_HEAP_MEGAPAGES: usize = 12;
+const INFERENCE_ARG0: usize = launch::AUDITED | INFERENCE_HEAP_MEGAPAGES << 16;
+/// The binder's slot for the inference service's granter (`launch-binder`'s `INFERENCE_GRANTER_CPTR`).
+const BINDER_INFERENCE_GRANTER: CPtr = 18;
+/// The launcher's slots for each app slot's channel to the inference service (`launcher`'s `IN_CHANNEL`).
+const LAUNCHER_IN_CHANNEL: CPtr = 72;
+/// RFC-0034: the store under `provenance::STORE_CONSOLE_BADGE`, the shell's `write`, with its own channel.
+const SHELL_STORE_CONSOLE_CPTR: CPtr = 12;
+const SHELL_STORE_CONSOLE_VADDR: usize = 0x9002_0000;
+const STORE_CONSOLE_BADGE: u64 = launch::GRANTER_BADGE - 2;
+const STORE_CONSOLE_FRAME_VADDR: usize = STORE_CLIENT_FRAME_VADDR + APP_SLOTS * CHANNEL_STRIDE;
+
+/// RFC-0035: each driver's slots (as `blk-driver`'s: its endpoint, line, notification, DMA, own VSpace, failure report)
+/// and `arg0`'s flag for a device the machine doesn't have.
+const D_ENDPOINT: CPtr = 1;
+const D_IRQ: CPtr = 2;
+const D_NOTIFY: CPtr = 3;
+const D_DMA: CPtr = 4;
+const D_SELF_VSPACE: CPtr = 5;
+const D_FAILURE: CPtr = 6;
+const DEVICE_ABSENT: usize = 1;
+const VIRTIO_NET: u32 = 1;
+const VIRTIO_RNG: u32 = 4;
+/// `net`'s slots and addresses.
+const N_ENDPOINT: CPtr = 1;
+const N_DRIVER: CPtr = 2;
+const N_NOTIFY: CPtr = 3;
+const N_DEADLINE: CPtr = 4;
+const N_TIMER_BIT: CPtr = 5;
+const N_FAILURE: CPtr = 6;
+const N_DRIVER_VADDR: usize = 0x9000_0000;
+const N_CLIENT_VADDR: usize = 0x9001_0000;
+/// `lantern_abi::net::driver::BIT_RX` and `BIT_TIMER`, on `net`'s notification.
+const NET_BIT_RX: u64 = 1 << 0;
+const NET_BIT_TIMER: u64 = 1 << 1;
+/// `wallet`'s slots and addresses.
+const W_SELF_CNODE: CPtr = 0;
+const W_ENDPOINT: CPtr = 1;
+const W_AUDIT: CPtr = 3;
+const W_VOLUME: CPtr = 4;
+const W_RNG: CPtr = 5;
+const W_NET: CPtr = 6;
+const W_KEYSTORE: CPtr = 7;
+const W_FAILURE: CPtr = 9;
+const W_CLIENT_VADDR: usize = 0x9001_0000;
+const W_VOLUME_VADDR: usize = 0x9002_0000;
+const W_NET_VADDR: usize = 0x9003_0000;
+const W_KEYSTORE_VADDR: usize = 0x9004_0000;
+/// `lantern_abi::identity::KEYSTORE_BADGE` and `READER_BADGE`, and `policy::WALLET_WRITER_BADGE`.
+const WALLET_KEYSTORE_BADGE: u64 = launch::GRANTER_BADGE - 1;
+const WALLET_READER_BADGE: u64 = launch::GRANTER_BADGE - 1;
+const WALLET_WRITER_BADGE: u64 = launch::READER_BADGE - 4;
+/// The binder's slot for the wallet's granter, the launcher's for each app slot's channel to it, and the shell's for its
+/// reader badge.
+const BINDER_WALLET_GRANTER: CPtr = 19;
+const LAUNCHER_ID_CHANNEL: CPtr = 76;
+const SHELL_WALLET_READER_CPTR: CPtr = 13;
+/// The keystore's channel for the wallet, after the app slots' and the store's.
+const KEYSTORE_WALLET_CHANNEL: usize = APP_SLOTS + 1;
+
 /// `policy-store`'s panic report.
 const POLICY_STORE_FAILURE_CPTR: CPtr = 4;
 /// `launch-binder`'s own CNode, with a launcher.
@@ -118,6 +205,9 @@ const SHELL_CONTROL_CPTR: CPtr = 4;
 const SHELL_READER_CPTR: CPtr = 5;
 const SHELL_ANSWER_CPTR_BASE: CPtr = 6;
 const SHELL_LAUNCHER_CPTR: CPtr = 10;
+/// RFC-0033: the store under `lantern_abi::provenance::STORE_READER_BADGE`, sizes and provenance only.
+const SHELL_STORE_READER_CPTR: CPtr = 11;
+const STORE_READER_BADGE: u64 = launch::GRANTER_BADGE - 1;
 const SHELL_UART_VADDR: usize = 0x9500_0000;
 const SHELL_LAUNCHER_VADDR: usize = 0x9001_0000;
 
@@ -210,6 +300,21 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let granter = mint(state, &mut next_slot, endpoint, Rights::WRITE, launch::GRANTER_BADGE);
     let store_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
     let store_granter = mint(state, &mut next_slot, store_endpoint, Rights::WRITE, launch::GRANTER_BADGE);
+    let store_reader = mint(state, &mut next_slot, store_endpoint, Rights::WRITE, STORE_READER_BADGE);
+    let store_console = mint(state, &mut next_slot, store_endpoint, Rights::WRITE, STORE_CONSOLE_BADGE);
+    // RFC-0034: the inference service, and the binder's granter on it.
+    let inference_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
+    let inference_granter = mint(state, &mut next_slot, inference_endpoint, Rights::WRITE, launch::GRANTER_BADGE);
+    // RFC-0035: randomness, the network card, the network service and the wallet, and the badges each serves.
+    let rng_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
+    let rng_for_wallet = mint(state, &mut next_slot, rng_endpoint, Rights::WRITE, 1);
+    let net_driver_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
+    let net_driver_for_net = mint(state, &mut next_slot, net_driver_endpoint, Rights::WRITE, 1);
+    let net_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
+    let net_for_wallet = mint(state, &mut next_slot, net_endpoint, Rights::WRITE, 1);
+    let wallet_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
+    let wallet_granter = mint(state, &mut next_slot, wallet_endpoint, Rights::WRITE, launch::GRANTER_BADGE);
+    let wallet_reader = mint(state, &mut next_slot, wallet_endpoint, Rights::WRITE, WALLET_READER_BADGE);
     // RFC-0031: the driver, its one client's badge, and the volume's three.
     let driver_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
     let driver_for_volume = mint(state, &mut next_slot, driver_endpoint, Rights::WRITE, DRIVER_BADGE_VOLUME);
@@ -218,6 +323,8 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let volume_store = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_STORE);
     let volume_binder = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_BINDER);
     let volume_policy = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_POLICY);
+    let volume_models = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_MODELS);
+    let volume_wallet = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_WALLET);
     let (blk_paddr, blk_line) = launch::find_virtio_blk().expect("no virtio-blk device: this image needs a disk");
     let driver_notification = retype(state, &mut next_slot, ObjectType::Notification);
     let driver_notify = mint(state, &mut next_slot, driver_notification, Rights::ALL, 1);
@@ -237,6 +344,30 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let policy_reader = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, launch::READER_BADGE);
     let keystore_writer = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, launch::KEYSTORE_WRITER_BADGE);
     let store_writer = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, launch::STORE_WRITER_BADGE);
+    let inference_writer = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, launch::INFERENCE_WRITER_BADGE);
+    let wallet_writer = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, WALLET_WRITER_BADGE);
+    let keystore_for_wallet = mint(state, &mut next_slot, endpoint, Rights::WRITE, WALLET_KEYSTORE_BADGE);
+    // The drivers' devices, lines and DMA memory, if the machine has them; `net`'s notification, where the network card's
+    // interrupt goes, and its deadline.
+    let rng_device = launch::find_virtio(VIRTIO_RNG);
+    let net_device = launch::find_virtio(VIRTIO_NET);
+    let rng_notification = retype(state, &mut next_slot, ObjectType::Notification);
+    let rng_notify = mint(state, &mut next_slot, rng_notification, Rights::ALL, 1);
+    let net_notification = retype(state, &mut next_slot, ObjectType::Notification);
+    let net_rx_bit = mint(state, &mut next_slot, net_notification, Rights::WRITE, NET_BIT_RX);
+    let net_timer_bit = mint(state, &mut next_slot, net_notification, Rights::WRITE, NET_BIT_TIMER);
+    let net_deadline = slot(&mut next_slot);
+    launch::deadline(state, root, net_deadline);
+    let device = |state: &mut _, next_slot: &mut CPtr, found: Option<(usize, u16)>| -> (CPtr, CPtr) {
+        let (irq, dma) = (slot(next_slot), slot(next_slot));
+        if let Some((_, line)) = found {
+            launch::irq_handler(state, root, line, irq);
+            launch::dma_untyped(state, root, untyped_cptr, dma, DMA_BYTES);
+        }
+        (irq, dma)
+    };
+    let (rng_irq, rng_dma) = device(state, &mut next_slot, rng_device);
+    let (net_irq, net_dma) = device(state, &mut next_slot, net_device);
     // The shell's notification, and one write-only badge for each of its inputs.
     let shell_notify = retype(state, &mut next_slot, ObjectType::Notification);
     let console_bit = mint(state, &mut next_slot, shell_notify, Rights::WRITE, BIT_CONSOLE);
@@ -271,6 +402,8 @@ pub unsafe fn run(mem_end: usize) -> ! {
     };
     let ks_channels: [CPtr; APP_SLOTS] = core::array::from_fn(|_| small_frame(state, &mut next_slot));
     let st_channels: [CPtr; APP_SLOTS] = core::array::from_fn(|_| small_frame(state, &mut next_slot));
+    let in_channels: [CPtr; APP_SLOTS] = core::array::from_fn(|_| small_frame(state, &mut next_slot));
+    let id_channels: [CPtr; APP_SLOTS] = core::array::from_fn(|_| small_frame(state, &mut next_slot));
 
     let shell_grants = [
         (irq, SHELL_IRQ_CPTR),
@@ -283,8 +416,11 @@ pub unsafe fn run(mem_end: usize) -> ! {
         (answers[2], SHELL_ANSWER_CPTR_BASE + 2),
         (answers[3], SHELL_ANSWER_CPTR_BASE + 3),
         (command_bit, SHELL_LAUNCHER_CPTR),
+        (store_reader, SHELL_STORE_READER_CPTR),
+        (store_console, SHELL_STORE_CONSOLE_CPTR),
+        (wallet_reader, SHELL_WALLET_READER_CPTR),
     ];
-    let mut launcher_grants = [(0, 0); 5 + 5 * APP_SLOTS];
+    let mut launcher_grants = [(0, 0); 5 + 7 * APP_SLOTS];
     let fixed = [
         (app_memory, LAUNCHER_MEMORY),
         (launcher_notify, LAUNCHER_NOTIFY),
@@ -294,14 +430,27 @@ pub unsafe fn run(mem_end: usize) -> ! {
     ];
     launcher_grants[..fixed.len()].copy_from_slice(&fixed);
     for app in 0..APP_SLOTS {
-        let at = fixed.len() + app * 5;
+        let at = fixed.len() + app * 7;
         launcher_grants[at] = (app_binder[app], LAUNCHER_APP_BINDER + app);
         launcher_grants[at + 1] = (ended_bits[app], LAUNCHER_SHELL_ENDED + app);
         launcher_grants[at + 2] = (failed_bits[app], LAUNCHER_SHELL_FAILED + app);
         launcher_grants[at + 3] = (ks_channels[app], LAUNCHER_KS_CHANNEL + app);
         launcher_grants[at + 4] = (st_channels[app], LAUNCHER_ST_CHANNEL + app);
+        launcher_grants[at + 5] = (in_channels[app], LAUNCHER_IN_CHANNEL + app);
+        launcher_grants[at + 6] = (id_channels[app], LAUNCHER_ID_CHANNEL + app);
     }
-    let launcher_grants = &launcher_grants[..fixed.len() + 5 * APP_SLOTS];
+    let launcher_grants = &launcher_grants[..fixed.len() + 7 * APP_SLOTS];
+    // A driver with no device gets its endpoint and its failure report, and nothing to drive.
+    let rng_grants = [(rng_endpoint, D_ENDPOINT), (system_failed_bit, D_FAILURE), (rng_irq, D_IRQ), (rng_notify, D_NOTIFY), (rng_dma, D_DMA)];
+    let net_driver_grants =
+        [(net_driver_endpoint, D_ENDPOINT), (system_failed_bit, D_FAILURE), (net_irq, D_IRQ), (net_rx_bit, D_NOTIFY), (net_dma, D_DMA)];
+    fn driver_grants(grants: &[(CPtr, CPtr); 5], present: bool) -> &[(CPtr, CPtr)] {
+        if present {
+            grants
+        } else {
+            &grants[..2]
+        }
+    }
     let specs = [
         ProgramSpec {
             elf_bytes: SHELL_ELF,
@@ -347,6 +496,8 @@ pub unsafe fn run(mem_end: usize) -> ! {
                 (ask_done_bit, launch::BINDER_SHELL_DONE_CPTR),
                 (ask_cancelled_bit, launch::BINDER_SHELL_CANCELLED_CPTR),
                 (volume_binder, BINDER_VOLUME),
+                (inference_granter, BINDER_INFERENCE_GRANTER),
+                (wallet_granter, BINDER_WALLET_GRANTER),
             ],
             self_cnode_dest: Some(BINDER_SELF_CNODE_CPTR),
             heap_megapages: launch::BINDER_HEAP_MEGAPAGES,
@@ -394,8 +545,68 @@ pub unsafe fn run(mem_end: usize) -> ! {
             heap_megapages: 0,
             arena: None,
         },
+        ProgramSpec {
+            elf_bytes: INFERENCE_SERVICE_ELF,
+            arg0: INFERENCE_ARG0,
+            grants: &[
+                (inference_endpoint, INFERENCE_ENDPOINT),
+                (inference_writer, INFERENCE_AUDIT),
+                (volume_models, INFERENCE_VOLUME),
+                (system_failed_bit, INFERENCE_FAILURE),
+            ],
+            self_cnode_dest: Some(INFERENCE_SELF_CNODE),
+            heap_megapages: INFERENCE_HEAP_MEGAPAGES,
+            arena: None,
+        },
+        ProgramSpec {
+            elf_bytes: RNG_DRIVER_ELF,
+            arg0: if rng_device.is_some() { 0 } else { DEVICE_ABSENT },
+            grants: driver_grants(&rng_grants, rng_device.is_some()),
+            self_cnode_dest: None,
+            heap_megapages: 0,
+            arena: Some(ArenaGrant { megapages: 0, self_vspace_dest: D_SELF_VSPACE, frame_dest_base: 0 }),
+        },
+        ProgramSpec {
+            elf_bytes: NET_DRIVER_ELF,
+            arg0: if net_device.is_some() { 0 } else { DEVICE_ABSENT },
+            grants: driver_grants(&net_driver_grants, net_device.is_some()),
+            self_cnode_dest: None,
+            heap_megapages: 0,
+            arena: Some(ArenaGrant { megapages: 0, self_vspace_dest: D_SELF_VSPACE, frame_dest_base: 0 }),
+        },
+        ProgramSpec {
+            elf_bytes: NET_ELF,
+            arg0: 0,
+            grants: &[
+                (net_endpoint, N_ENDPOINT),
+                (net_driver_for_net, N_DRIVER),
+                (net_notification, N_NOTIFY),
+                (net_deadline, N_DEADLINE),
+                (net_timer_bit, N_TIMER_BIT),
+                (system_failed_bit, N_FAILURE),
+            ],
+            self_cnode_dest: None,
+            heap_megapages: 0,
+            arena: None,
+        },
+        ProgramSpec {
+            elf_bytes: WALLET_ELF,
+            arg0: 0,
+            grants: &[
+                (wallet_endpoint, W_ENDPOINT),
+                (wallet_writer, W_AUDIT),
+                (volume_wallet, W_VOLUME),
+                (rng_for_wallet, W_RNG),
+                (net_for_wallet, W_NET),
+                (keystore_for_wallet, W_KEYSTORE),
+                (system_failed_bit, W_FAILURE),
+            ],
+            self_cnode_dest: Some(W_SELF_CNODE),
+            heap_megapages: 0,
+            arena: None,
+        },
     ];
-    let [shell, keystore, store, binder, launcher, policy_store, driver, volume] =
+    let [shell, keystore, store, binder, launcher, policy_store, driver, volume, inference, rng_driver, net_driver, net, wallet] =
         launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
     launch::map_small_device_frame(state, root, UART_PADDR, shell.vspace_cptr, SHELL_UART_VADDR, &mut next_slot);
     // The runtime's ELF, the launcher's alone. The packages are on the disk.
@@ -406,7 +617,20 @@ pub unsafe fn run(mem_end: usize) -> ! {
         let at = app * CHANNEL_STRIDE;
         launch::map(state, root, ks_channels[app], keystore.vspace_cptr, KEYSTORE_CHANNEL_VADDR + at, rw);
         launch::map(state, root, st_channels[app], store.vspace_cptr, STORE_CLIENT_FRAME_VADDR + at, rw);
+        launch::map(state, root, in_channels[app], inference.vspace_cptr, INFERENCE_CLIENT_VADDR + at, rw);
+        launch::map(state, root, id_channels[app], wallet.vspace_cptr, W_CLIENT_VADDR + at, rw);
     }
+    // RFC-0034: the shell's channel to the store, for `write`.
+    launch::map_shared_frame(
+        state,
+        root,
+        untyped_cptr,
+        store.vspace_cptr,
+        STORE_CONSOLE_FRAME_VADDR,
+        shell.vspace_cptr,
+        SHELL_STORE_CONSOLE_VADDR,
+        &mut next_slot,
+    );
     // The store's own channel to the keystore, after the apps'.
     let store_channel_on_keystore = KEYSTORE_CHANNEL_VADDR + APP_SLOTS * CHANNEL_STRIDE;
     launch::map_shared_frame(
@@ -450,11 +674,40 @@ pub unsafe fn run(mem_end: usize) -> ! {
         (store.vspace_cptr, STORE_VOLUME_VADDR, VOLUME_BADGE_STORE),
         (binder.vspace_cptr, CLIENT_VOLUME_VADDR, VOLUME_BADGE_BINDER),
         (policy_store.vspace_cptr, POLICY_STORE_VOLUME_VADDR, VOLUME_BADGE_POLICY),
+        (inference.vspace_cptr, INFERENCE_VOLUME_VADDR, VOLUME_BADGE_MODELS),
+        (wallet.vspace_cptr, W_VOLUME_VADDR, VOLUME_BADGE_WALLET),
     ] {
         let at = VOLUME_CLIENT_VADDR + (badge as usize - 1) * CHANNEL_STRIDE;
         share(state, volume.vspace_cptr, at, client, vaddr);
     }
-    for tcb in [keystore.tcb, store.tcb, binder.tcb, launcher.tcb, policy_store.tcb, driver.tcb, volume.tcb] {
+    // RFC-0035: the drivers' register pages, and the channels between the network card's driver and `net`, `net` and the
+    // wallet, and the keystore and the wallet.
+    for (found, program) in [(rng_device, &rng_driver), (net_device, &net_driver)] {
+        if let Some((paddr, _)) = found {
+            launch::map_small_device_frame(state, root, paddr, program.vspace_cptr, DRIVER_REGS_VADDR, &mut next_slot);
+        }
+    }
+    let mut share = |state: &mut _, a, a_vaddr, b, b_vaddr| {
+        launch::map_shared_frame(state, root, untyped_cptr, a, a_vaddr, b, b_vaddr, &mut next_slot)
+    };
+    share(state, net_driver.vspace_cptr, DRIVER_CHANNEL_VADDR, net.vspace_cptr, N_DRIVER_VADDR);
+    share(state, net.vspace_cptr, N_CLIENT_VADDR, wallet.vspace_cptr, W_NET_VADDR);
+    let keystore_wallet = KEYSTORE_CHANNEL_VADDR + KEYSTORE_WALLET_CHANNEL * CHANNEL_STRIDE;
+    share(state, keystore.vspace_cptr, keystore_wallet, wallet.vspace_cptr, W_KEYSTORE_VADDR);
+    for tcb in [
+        keystore.tcb,
+        store.tcb,
+        binder.tcb,
+        launcher.tcb,
+        policy_store.tcb,
+        driver.tcb,
+        volume.tcb,
+        inference.tcb,
+        rng_driver.tcb,
+        net_driver.tcb,
+        net.tcb,
+        wallet.tcb,
+    ] {
         state.make_ready(tcb);
     }
     crate::println!(

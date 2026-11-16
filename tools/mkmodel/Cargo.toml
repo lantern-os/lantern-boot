@@ -1,0 +1,16 @@
+[package]
+name = "lantern-mkmodel"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0034's model tool: a llama2.c f32 checkpoint and its tokenizer to an LMODEL01 model file for the inference service, with its BLAKE3 digest. A host program: build it with --target <host triple>, since lantern-boot defaults to riscv64."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-mkmodel"
+path = "src/main.rs"
+
+[dependencies]
+# Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/..."` when pushing lantern-boot standalone.
+lantern-ai-runtime = { git = "https://github.com/lantern-os/lantern-ai-runtime", branch = "main", features = ["std"] }
+blake3 = "1"

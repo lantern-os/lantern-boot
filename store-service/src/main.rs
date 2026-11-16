@@ -55,6 +55,7 @@ use lantern_abi::block::{self, Client, SECTOR};
 use lantern_abi::frame::{self, status, Channel, ChannelMap, Interloper};
 use lantern_abi::grant::{self, Incoming};
 use lantern_abi::policy::{self, event, AuditEntry};
+use lantern_abi::provenance::{self, STORE_CONSOLE_BADGE, STORE_READER_BADGE};
 use lantern_abi::sys::{self, Received};
 use lantern_capabilities::Abi;
 use lantern_filesystem::cipher::ChannelCipher;
@@ -94,6 +95,12 @@ const CLIENT_FRAME_VADDR: usize = 0x9001_0000;
 /// per app slot, `CHANNEL_STRIDE` apart from [`CLIENT_FRAME_VADDR`]. Each badge is served on the channel its `GRANT` named,
 /// and only there.
 const CHANNEL_STRIDE: usize = 0x1000;
+/// [RFC-0034](../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md): the shell's channel, for what a
+/// person writes at the console, after the app slots'.
+const CONSOLE_FRAME_VADDR: usize = CLIENT_FRAME_VADDR + grant::APP_SLOTS * CHANNEL_STRIDE;
+/// How many files the policy names: 0 for the filesystem probe, 1 and 2 for the file assistant's input and output.
+const FILES: usize = 3;
+
 /// Live grants with a channel. Matches `lantern_filesystem`'s own grant capacity.
 const MAPPED_GRANTS: usize = 32;
 
@@ -133,6 +140,10 @@ fn run(arg0: usize) -> ! {
             (store, 0, file)
         }
     };
+    // RFC-0034: an image from before the file assistant has only file 0.
+    let _ = store.ensure_files(FILES);
+    // RFC-0033: every write from now on is dated by this start.
+    store.start();
 
     let mut backend = Abi;
     let audited = arg0 & grant::AUDITED != 0;
@@ -175,8 +186,70 @@ fn run(arg0: usize) -> ! {
     let mut all: [Channel; grant::APP_SLOTS] = core::array::from_fn(|c| unsafe {
         Channel::new(CLIENT_ENDPOINT_CPTR, (CLIENT_FRAME_VADDR + c * CHANNEL_STRIDE) as *mut u8)
     });
+    // SAFETY: with MANY_CLIENTS, the loader mapped the shell's channel read/write at CONSOLE_FRAME_VADDR; without, the
+    // console badge is never minted, so this channel is never reached.
+    let mut console = unsafe { Channel::new(CLIENT_ENDPOINT_CPTR, CONSOLE_FRAME_VADDR as *mut u8) };
     loop {
         let Ok(received) = sys::recv(CLIENT_ENDPOINT_CPTR) else { continue };
+        if received.badge == STORE_READER_BADGE {
+            serve_reader(&store, &received);
+            continue;
+        }
+        if received.badge == STORE_CONSOLE_BADGE && many {
+            let mut request = [0u8; REQUEST_CAP + 2];
+            let mut others = Others { store: &mut store, backend: &mut backend, channels: &mut channels, many };
+            let Ok((op, len)) = console.recv_request(received, &mut request, &mut others) else { continue };
+            let mut reply = [0u8; REQUEST_CAP];
+            let mut reply_len = 0;
+            let mut wrote = false;
+            let mut status = match (op, provenance::decode_console_write(&request[..len])) {
+                (provenance::OP_CONSOLE_WRITE, Some((file, content))) => {
+                    let mut write = || {
+                        let mut cipher = ChannelCipher::new(&mut ks_channel);
+                        match store.write_from_console(&mut cipher, FileId::from_raw(file), content) {
+                            Ok(()) => (status::OK, ()),
+                            Err(_) => (status::INVALID, ()),
+                        }
+                    };
+                    // Recorded like any write, under the console's badge, before it happens.
+                    let using = AuditEntry {
+                        object: file,
+                        ops: FileOps::WRITE.bits(),
+                        subject: [STORE_CONSOLE_BADGE, content.len() as u64],
+                        ..AuditEntry::default()
+                    };
+                    let outcome = if audited { policy::audited(AUDIT_CPTR, &using, write) } else { Ok(write()) };
+                    wrote = true;
+                    outcome.map_or(status::FAILED, |(status, ())| status)
+                }
+                (provenance::OP_CONSOLE_READ, Some((file, []))) => {
+                    let mut read = || {
+                        let mut cipher = ChannelCipher::new(&mut ks_channel);
+                        match store.read_from_console(&mut cipher, FileId::from_raw(file), &mut reply) {
+                            Ok(n) => (status::OK, n),
+                            Err(lantern_filesystem::StoreError::FileEmpty) => (status::OK, 0),
+                            Err(_) => (status::INVALID, 0),
+                        }
+                    };
+                    let using =
+                        AuditEntry { object: file, ops: FileOps::READ.bits(), subject: [STORE_CONSOLE_BADGE, 0], ..AuditEntry::default() };
+                    let outcome = if audited { policy::audited(AUDIT_CPTR, &using, read) } else { Ok(read()) };
+                    let (status, n) = outcome.unwrap_or((status::FAILED, 0));
+                    reply_len = n;
+                    status
+                }
+                _ => status::INVALID,
+            };
+            if let (Some(volume), status::OK, true) = (volume.as_mut(), status, wrote) {
+                match save(volume, &store, &mut ks_channel, seq + 1, &mut image) {
+                    true => seq += 1,
+                    false => status = status::FAILED,
+                }
+            }
+            let mut others = Others { store: &mut store, backend: &mut backend, channels: &mut channels, many };
+            let _ = console.reply(status, &reply[..reply_len], received.badge, &mut others);
+            continue;
+        }
         match grant::classify(&received) {
             Incoming::Data => {
                 let Some(channel) = (if many { channels.channel_for(received.badge) } else { Some(0) }) else {
@@ -236,8 +309,12 @@ struct Others<'a> {
 
 impl Interloper for Others<'_> {
     fn serve(&mut self, received: Received) {
+        if received.badge == STORE_READER_BADGE {
+            serve_reader(self.store, &received);
+            return;
+        }
         match grant::classify(&received) {
-            Incoming::Grant { object, ops, channel } => {
+            Incoming::Grant { object, ops, channel, principal } => {
                 let channel = match (self.many, channel) {
                     (false, _) => None,
                     (true, Some(c)) if c < grant::APP_SLOTS => Some(c as u8),
@@ -246,7 +323,7 @@ impl Interloper for Others<'_> {
                         return;
                     }
                 };
-                serve_grant(self.store, self.backend, self.channels, object, ops, channel)
+                serve_grant(self.store, self.backend, self.channels, object, ops, channel, principal)
             }
             Incoming::Revoke { badge } => {
                 let status = if self.store.revoke_access(badge).is_ok() { status::OK } else { status::INVALID };
@@ -284,6 +361,7 @@ fn serve_grant(
     object: usize,
     ops: usize,
     channel: Option<u8>,
+    principal: provenance::Principal,
 ) {
     let request = u16::try_from(object)
         .ok()
@@ -297,7 +375,8 @@ fn serve_grant(
         let _ = grant::reply_status(status::FAILED);
         return;
     }
-    let granted = store.request_file_access(backend, FileId::from_raw(object), ops, CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR).and_then(|badge| {
+    let file = FileId::from_raw(object);
+    let granted = store.request_file_access_for(backend, file, ops, CLIENT_ENDPOINT_CPTR, SCRATCH_CPTR, principal).and_then(|badge| {
         if let Some(c) = channel {
             channels.bind(badge, c, |b| store.is_revoked(b));
         }
@@ -338,4 +417,24 @@ fn save(volume: &mut Client, store: &Store, ks_channel: &mut Channel, seq: u64, 
         .chunks(block::MAX_BYTES)
         .enumerate()
         .all(|(i, chunk)| volume.write((first + i * block::MAX_SECTORS) as u64, chunk).is_ok())
+}
+
+/// [RFC-0033](../../lantern-rfcs/rfcs/0033-provenance-for-data-at-rest.md)'s reader, the shell's: each file's size and
+/// its last writes, never its content.
+fn serve_reader(store: &Store, received: &Received) {
+    let (op, file, k) = provenance::reader_request(received);
+    let _ = match op {
+        provenance::OP_FILE_INFO => match store.file_info(file) {
+            Some(info) => provenance::reply(status::OK, 0, provenance::encode_info(info)),
+            None => provenance::reply(status::INVALID, 0, 0),
+        },
+        provenance::OP_FILE_ENTRY => match store.file_entry(file, k) {
+            Some(entry) => {
+                let (first, write) = provenance::encode_entry(entry);
+                provenance::reply(status::OK, first, write)
+            }
+            None => provenance::reply(status::INVALID, 0, 0),
+        },
+        _ => provenance::reply(status::INVALID, 0, 0),
+    };
 }

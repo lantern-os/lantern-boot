@@ -16,6 +16,10 @@ pub fn access(layout: Layout, client: u64) -> Option<(Extent, bool)> {
         badge::STORE => Some((layout.store, true)),
         // RFC-0032: the policy store's log, on a disk that has a partition for it.
         badge::POLICY => layout.policy.map(|p| (p, true)),
+        // RFC-0034: the model, read-only, to the inference service, on a disk that has one.
+        badge::MODELS => layout.models.map(|m| (m, false)),
+        // RFC-0035: the wallet's sealed root, read and write, on a disk that has a partition for it.
+        badge::WALLET => layout.wallet.map(|w| (w, true)),
         _ => None,
     }
 }
@@ -42,6 +46,8 @@ mod tests {
         packages: Extent { first: 2048, sectors: 100 },
         store: Extent { first: 4096, sectors: 64 },
         policy: Some(Extent { first: 8192, sectors: 4096 }),
+        models: Some(Extent { first: 16384, sectors: 8192 }),
+        wallet: Some(Extent { first: 24576, sectors: 64 }),
     };
 
     #[test]
@@ -51,7 +57,11 @@ mod tests {
         assert_eq!(access(LAYOUT, badge::STORE), Some((LAYOUT.store, true)));
         assert_eq!(access(LAYOUT, badge::POLICY), Some((LAYOUT.policy.unwrap(), true)));
         assert_eq!(access(Layout { policy: None, ..LAYOUT }, badge::POLICY), None, "no partition, no access");
-        for other in [0, 5, u64::MAX] {
+        assert_eq!(access(LAYOUT, badge::MODELS), Some((LAYOUT.models.unwrap(), false)), "the model is read-only");
+        assert_eq!(access(Layout { models: None, ..LAYOUT }, badge::MODELS), None);
+        assert_eq!(access(LAYOUT, badge::WALLET), Some((LAYOUT.wallet.unwrap(), true)));
+        assert_eq!(access(Layout { wallet: None, ..LAYOUT }, badge::WALLET), None);
+        for other in [0, 7, u64::MAX] {
             assert_eq!(access(LAYOUT, other), None);
         }
     }

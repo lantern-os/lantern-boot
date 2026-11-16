@@ -562,6 +562,32 @@
     file.
   - **`console-matrix.sh`:** 25 cases, now with the audit log read from the disk, and each boot waiting for its first
     records to reach it.
+- **Provenance (2026-11-15, [RFC-0033](../lantern-rfcs/rfcs/0033-provenance-for-data-at-rest.md)/[ADR-0038](../lantern-rfcs/adr/0038-provenance-for-data-at-rest.md)).** `store-service` records each grant's principal, counts its starts, and answers
+  the shell's reader badge. The system image gives the shell that badge. `console-matrix.sh` gains a case: `files`
+  names the app that wrote, and keeps it across a reboot (26 cases).
+- **Local inference and a file assistant (2026-11-16, [RFC-0034](../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md)/[ADR-0039](../lantern-rfcs/adr/0039-local-inference-and-a-file-assistant.md)).**
+  - New `inference-service`: the model read from the disk's model partition through the volume, its BLAKE3 digest checked
+    against `assets/model.digest`, then served to the binder's grants, each call recorded first. Its grant table is a
+    host-tested library (3 tests).
+  - The volume serves the model partition read-only (badge 5); `lantern-mkdisk --model` writes it (32 MiB, after the
+    policy store's, so the other partitions don't move); new host tool `tools/mkmodel`; `scripts/get-model.sh` downloads
+    and pins the model. `make-image.sh` includes it and the file assistant's package, unless `LANTERN_NO_MODEL=1`.
+  - `store-service` serves the shell's `write` and `read` on their own channel, both audited, and makes the files the
+    policy names.
+  - **Found and fixed:** `keystore-service`'s request buffer was 256 bytes, so the store couldn't seal a file over about
+    190 bytes. It now holds a full block's request.
+  - `console-matrix.sh` gains 5 cases (31): the assistant granted, the model declined, text that tells the model what to
+    do, a changed model and none. `boot-disk.sh` runs the assistant on both boots.
+- **Networking and pairwise identities (2026-11-16, [RFC-0035](../lantern-rfcs/rfcs/0035-pairwise-network-identities.md)/[ADR-0040](../lantern-rfcs/adr/0040-pairwise-network-identities.md)).**
+  - New confined programs: `rng-driver` (virtio-rng), `net-driver` (virtio-net, parses nothing), `net` (IPv4/UDP via
+    `lantern-network`, holds no key), and `wallet` (its root sealed on the new wallet partition, pairwise identities,
+    Noise sessions, every use audited; its grant table and sealed-root format are a host-tested library, 4 tests). A
+    shared `virtio` crate for the two new drivers. Without the devices, both drivers refuse every request.
+  - `keystore-service` grants the wallet a sealing key of its own, once, by its badge, whichever of it and the store calls
+    first.
+  - `lantern-mkdisk` adds a 1 MiB wallet partition; disks are 128 MiB by default. New host tool `tools/peer`, a test peer
+    using `snow`. New `scripts/net-matrix.sh`, 6 cases, against two of them.
+  - The system image takes 228 root slots and 95 Frames before any app; the kernel's limits were raised to match.
 ## Next
 - `x86-64` boot: a separate, harder bring-up problem (real → protected → long mode, GDT/TSS
   setup) — deferred, matching how `lantern-hal`'s trap entries were sequenced.

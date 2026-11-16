@@ -1,0 +1,22 @@
+[package]
+name = "lantern-net"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0035's network service: a minimal IPv4/UDP stack (lantern-network) between the net driver and one client, the wallet. Parses everything the network sends; holds no key and no DMA."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-net"
+path = "src/main.rs"
+
+[dependencies]
+# Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/..."` when pushing lantern-boot standalone.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-network = { git = "https://github.com/lantern-os/lantern-network", branch = "main" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

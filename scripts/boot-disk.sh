@@ -3,9 +3,9 @@
 # PE/COFF, writes a bootable disk with `lantern-mkdisk --bootable`, and boots QEMU `virt` with EDK2 and that disk alone.
 #
 #   first boot   the firmware runs \EFI\BOOT\BOOTRISCV64.EFI, which starts LanternOS; `run confined-fs-probe`, answered
-#                "always", finishes.
-#   second boot  the same disk: the app runs again without a prompt (the decision was kept on the disk), and the store's
-#                second image follows its first (its file was kept on the disk).
+#                "always", finishes; so does the file assistant (RFC-0034), its model read from the disk's model partition.
+#   second boot  the same disk: both run again without a prompt (the decisions were kept on the disk), and the store's
+#                images follow the first boot's (its files were kept on the disk).
 #
 #   EDK2_CODE / EDK2_VARS   the firmware (default: Debian/Ubuntu's qemu-efi-riscv64 package)
 #
@@ -24,9 +24,10 @@ TARGET=target/riscv64gc-unknown-none-elf/release
 (cd efi-loader && cargo build -q --release) || exit 2
 (cd tools/elf2efi && cargo run -q --target "$HOST" -- ../../efi-loader/$TARGET/lantern-efi-loader "$WORK/BOOTRISCV64.EFI") || exit 2
 cargo build -q --release --bin lantern-boot-system || exit 2
+MODEL=$(scripts/get-model.sh) || exit 2
 (cd tools/mkdisk && cargo run -q --target "$HOST" -- --out "$WORK/disk.img" --bootable --loader "$WORK/BOOTRISCV64.EFI" \
     --boot-image "$OLDPWD/$TARGET/lantern-boot-system" --package "$OLDPWD/assets/probe.lpkg" \
-    --package "$OLDPWD/assets/fs-probe.lpkg") >/dev/null || exit 2
+    --package "$OLDPWD/assets/fs-probe.lpkg" --package "$OLDPWD/assets/file-assistant.lpkg" --model "$MODEL") >/dev/null || exit 2
 cp "$VARS_TEMPLATE" "$WORK/vars.fd"
 # The bootable layout, in sectors: the store partition after the EFI System Partition and the packages.
 STORE_SECTOR=100352
@@ -65,6 +66,16 @@ expect() {
     return 1
 }
 
+# expect_nth <text> <n>: as `expect`, for the n-th time it appears.
+expect_nth() {
+    for _ in $(seq 1 900); do
+        [ "$(grep -aoF -- "$1" "$WORK/out" | wc -l)" -ge "$2" ] && return 0
+        sleep 0.1
+    done
+    fail "no \"$1\" on the console $2 times"
+    return 1
+}
+
 store_seq() {
     python3 - "$WORK/disk.img" "$STORE_SECTOR" <<'PY'
 import struct, sys
@@ -72,7 +83,7 @@ disk, first = open(sys.argv[1], 'rb').read(), int(sys.argv[2])
 seqs = []
 for i in range(2):
     at = (first + i * 32) * 512
-    if disk[at:at + 8] == b'LSTORE01':
+    if disk[at:at + 8] in (b'LSTORE01', b'LSTORE02'):
         seqs.append(struct.unpack_from('<Q', disk, at + 8)[0])
 print(max(seqs) if seqs else 0)
 PY
@@ -80,15 +91,24 @@ PY
 
 PROMPT='allow? [y]es once, [a]lways, [n]o, n[e]ver >'
 DONE='lantern: "confined-fs-probe" finished.'
+AGENT_DONE='lantern: "file-assistant" finished.'
+CONTINUED='Spot. Spot loved to play outside in the sun.'
 
 CASE='the firmware boots LanternOS from its disk'
 boot
 expect 'Lantern EFI loader: starting LanternOS' && expect 'Type help for commands.'
 printf 'run confined-fs-probe\r' >&3
 expect "$PROMPT" && printf 'a\r' >&3 && expect "$DONE"
+printf 'write 1 Once upon a time, there was a little dog named\r' >&3 && expect 'written, as you.'
+printf 'run file-assistant\r' >&3
+for n in 2 3 4; do
+    expect_nth "$PROMPT" "$n" && printf 'a\r' >&3
+done
+expect "$AGENT_DONE" && printf 'read 2\r' >&3 && expect "  $CONTINUED"
 stop
 grep -aq 'PANIC' "$WORK/out" && fail 'a panic'
-[ "$(store_seq)" = 1 ] || fail "want the store's first image on the disk, got $(store_seq)"
+# Three writes: the app's, the person's, the assistant's.
+[ "$(store_seq)" = 3 ] || fail "want the store's third image on the disk, got $(store_seq)"
 [ "$failures" = 0 ] && printf 'ok    %s\n' "$CASE"
 
 CASE='a reboot keeps the decision and the file'
@@ -97,9 +117,11 @@ boot
 expect 'Type help for commands.'
 printf 'run confined-fs-probe\r' >&3
 expect "$DONE"
+printf 'run file-assistant\r' >&3
+expect "$AGENT_DONE" && printf 'read 2\r' >&3 && expect "  $CONTINUED"
 stop
 grep -aqF "$PROMPT" "$WORK/out" && fail 'asked again: the decision was lost'
-[ "$(store_seq)" = 2 ] || fail "want the store's second image, got $(store_seq)"
+[ "$(store_seq)" = 5 ] || fail "want the store's fifth image, got $(store_seq)"
 [ "$failures" = "$before" ] && printf 'ok    %s\n' "$CASE"
 
 [ "$failures" -eq 0 ] && echo 'all passed' || { echo "$failures failed"; exit 1; }
