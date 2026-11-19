@@ -95,8 +95,8 @@ const DEMO_SIGNING_SEED: [u8; 32] = [0x24; 32];
 const PROFILE_AEAD: usize = 0;
 const PROFILE_SIGNING: usize = 1;
 const PROFILE_SYSTEM: usize = 2;
-/// With [`PROFILE_SYSTEM`]: one channel per app slot, then the store's, then the wallet's.
-const CHANNELS: usize = grant::APP_SLOTS + 2;
+/// With [`PROFILE_SYSTEM`]: one channel per app slot, then the store's, the wallet's and the archiver's.
+const CHANNELS: usize = grant::APP_SLOTS + 3;
 const STORE_CHANNEL: u8 = grant::APP_SLOTS as u8;
 /// [RFC-0035](../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md): the wallet seals its root under a key of its
 /// own, granted once to whoever calls under this badge, which only the wallet holds.
@@ -104,6 +104,21 @@ const WALLET_CHANNEL: u8 = grant::APP_SLOTS as u8 + 1;
 const WALLET_BADGE: u64 = lantern_abi::identity::KEYSTORE_BADGE;
 /// Demo-only, as [`DEMO_AEAD_SEED`]: the wallet's sealing key.
 const DEMO_WALLET_SEED: [u8; 32] = [0x57; 32];
+/// [RFC-0038](../../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md): the archiver seals exported audit
+/// history under a key of its own, granted the same way.
+const ARCHIVER_CHANNEL: u8 = grant::APP_SLOTS as u8 + 2;
+const ARCHIVER_BADGE: u64 = lantern_abi::archive::KEYSTORE_BADGE;
+/// Demo-only, as [`DEMO_AEAD_SEED`]: the archiver's sealing key.
+const DEMO_ARCHIVE_SEED: [u8; 32] = [0x41; 32];
+
+/// A system program sealing under a key of its own, granted once, by its badge, whenever it first calls: the wallet's
+/// root (RFC-0035), the archiver's history (RFC-0038).
+struct Fixed {
+    badge: u64,
+    key: KeyId,
+    channel: u8,
+    granted: bool,
+}
 const CHANNEL_STRIDE: usize = 0x1000;
 /// Live grants with a channel. Matches `lantern_crypto`'s own grant capacity.
 const MAPPED_GRANTS: usize = 32;
@@ -138,9 +153,15 @@ fn run(arg0: usize) -> ! {
     let mut backend = Abi;
     let audited = arg0 & grant::AUDITED != 0;
 
-    // With the system profile, the wallet's sealing key, after the store's (RFC-0035).
-    let wallet_key = system.then(|| keystore.generate_aead_key(DEMO_WALLET_SEED).unwrap());
-    let mut wallet_granted = false;
+    // With the system profile, the wallet's sealing key, then the archiver's, after the store's (RFC-0035, RFC-0038).
+    let mut fixed: [Option<Fixed>; 2] = if system {
+        [
+            Some(Fixed { badge: WALLET_BADGE, key: keystore.generate_aead_key(DEMO_WALLET_SEED).unwrap(), channel: WALLET_CHANNEL, granted: false }),
+            Some(Fixed { badge: ARCHIVER_BADGE, key: keystore.generate_aead_key(DEMO_ARCHIVE_SEED).unwrap(), channel: ARCHIVER_CHANNEL, granted: false }),
+        ]
+    } else {
+        [None, None]
+    };
     let aead = KeyOps::ENCRYPT.union(KeyOps::DECRYPT);
 
     // Phase 1: one client Call's, registering its own reply-leg destination;
@@ -149,8 +170,8 @@ fn run(arg0: usize) -> ! {
     if arg0 & grant::BINDER_LAUNCHED == 0 || system {
         loop {
             let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
-            if let (Some(wallet_key), WALLET_BADGE, false) = (wallet_key, received.badge, wallet_granted) {
-                wallet_granted = fixed_grant(&mut keystore, &mut backend, &mut channels, wallet_key, aead, WALLET_CHANNEL, audited);
+            if let Some(f) = fixed.iter_mut().flatten().find(|f| f.badge == received.badge && !f.granted) {
+                f.granted = fixed_grant(&mut keystore, &mut backend, &mut channels, f.key, aead, f.channel, audited);
                 continue;
             }
             fixed_grant(&mut keystore, &mut backend, &mut channels, key, ops, if system { STORE_CHANNEL } else { 0 }, audited);
@@ -171,9 +192,9 @@ fn run(arg0: usize) -> ! {
         core::array::from_fn(|c| unsafe { Channel::new(ENDPOINT_CPTR, (FRAME_VADDR + c * CHANNEL_STRIDE) as *mut u8) });
     loop {
         let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
-        if let (Some(wallet_key), WALLET_BADGE, false) = (wallet_key, received.badge, wallet_granted) {
-            if received.tag.extra_caps == 2 {
-                wallet_granted = fixed_grant(&mut keystore, &mut backend, &mut channels, wallet_key, aead, WALLET_CHANNEL, audited);
+        if received.tag.extra_caps == 2 {
+            if let Some(f) = fixed.iter_mut().flatten().find(|f| f.badge == received.badge && !f.granted) {
+                f.granted = fixed_grant(&mut keystore, &mut backend, &mut channels, f.key, aead, f.channel, audited);
                 continue;
             }
         }
@@ -193,8 +214,11 @@ fn run(arg0: usize) -> ! {
                     let mut handle =
                         || lantern_crypto::wire::handle_request(&keystore, received.badge, op, &request[..len], &mut reply);
                     // A badge this keystore never minted names no grant, and `handle_request` refuses it.
+                    // The archiver's sealing isn't recorded in the log it seals: each export would add a quarter of a sector
+                    // of records about itself, and use up its grant's quota at once (RFC-0038). Its grant is recorded.
+                    let archiver_key = fixed[1].as_ref().map(|f| f.key);
                     let (status, reply_len) = match keystore.key_for_badge(received.badge) {
-                        Some(key) if audited => {
+                        Some(key) if audited && Some(key) != archiver_key => {
                             let using = AuditEntry {
                                 object: key.raw(),
                                 ops: op_bit(op),

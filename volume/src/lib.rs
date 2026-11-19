@@ -20,6 +20,8 @@ pub fn access(layout: Layout, client: u64) -> Option<(Extent, bool)> {
         badge::MODELS => layout.models.map(|m| (m, false)),
         // RFC-0035: the wallet's sealed root, read and write, on a disk that has a partition for it.
         badge::WALLET => layout.wallet.map(|w| (w, true)),
+        // RFC-0038: the audit archive, read and write, for the archiver alone.
+        badge::ARCHIVE => layout.archive.map(|a| (a, true)),
         _ => None,
     }
 }
@@ -48,6 +50,7 @@ mod tests {
         policy: Some(Extent { first: 8192, sectors: 4096 }),
         models: Some(Extent { first: 16384, sectors: 8192 }),
         wallet: Some(Extent { first: 24576, sectors: 64 }),
+        archive: Some(Extent { first: 24640, sectors: 1152 }),
     };
 
     #[test]
@@ -61,7 +64,9 @@ mod tests {
         assert_eq!(access(Layout { models: None, ..LAYOUT }, badge::MODELS), None);
         assert_eq!(access(LAYOUT, badge::WALLET), Some((LAYOUT.wallet.unwrap(), true)));
         assert_eq!(access(Layout { wallet: None, ..LAYOUT }, badge::WALLET), None);
-        for other in [0, 7, u64::MAX] {
+        assert_eq!(access(LAYOUT, badge::ARCHIVE), Some((LAYOUT.archive.unwrap(), true)));
+        assert_eq!(access(Layout { archive: None, ..LAYOUT }, badge::ARCHIVE), None);
+        for other in [0, 8, u64::MAX] {
             assert_eq!(access(LAYOUT, other), None);
         }
     }

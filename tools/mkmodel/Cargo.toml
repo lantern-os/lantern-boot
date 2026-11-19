@@ -14,3 +14,6 @@ path = "src/main.rs"
 # Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/..."` when pushing lantern-boot standalone.
 lantern-ai-runtime = { git = "https://github.com/lantern-os/lantern-ai-runtime", branch = "main", features = ["std"] }
 blake3 = "1"
+# RFC-0038: the model package and its signature.
+lantern-sdk = { git = "https://github.com/lantern-os/lantern-sdk", branch = "main" }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The model the image ships (RFC-0034): downloads Andrej Karpathy's TinyStories `stories15M` checkpoint and llama2.c's
-# tokenizer once, checks each against the SHA-256 pinned here, converts them with `lantern-mkmodel`, and checks the result
-# against `assets/model.digest`, the digest the inference service is built to accept. Prints the model file's path.
+# tokenizer once, checks each against the SHA-256 pinned here, converts them with `lantern-mkmodel`, checks the converted
+# model against the digest pinned here (the conversion is exact, so it's reproducible), and signs it as a model package
+# (RFC-0038) under the **public** demo publisher seed the system trusts. Prints the package's path.
 #
 # Both are MIT-licensed. About 61 MB, downloaded once into $LANTERN_MODEL_CACHE (default ~/.cache/lantern).
 set -eu
@@ -25,11 +26,14 @@ fetch tokenizer.bin \
     https://raw.githubusercontent.com/karpathy/llama2.c/350e04fe35433e6d2941dce5a1f53308f87058eb/tokenizer.bin \
     50a52ef822ee9e83de5ce9d0be0a025a773d019437f58b5ff9dcafb063ece361
 
-MODEL="$CACHE/stories15M.lmodel"
-want=$(head -c 64 assets/model.digest)
-if [ ! -f "$MODEL" ] || [ "$(cat "$MODEL.digest" 2>/dev/null)" != "$want" ]; then
-    digest=$(cd tools/mkmodel && cargo run -q --release --target "$HOST" -- "$CACHE/stories15M.bin" "$CACHE/tokenizer.bin" "$MODEL")
-    [ "$digest" = "$want" ] || { echo "get-model: the model converted to $digest, not $want (assets/model.digest)" >&2; exit 1; }
+# The converted model's BLAKE3 digest: the conversion is exact, so a different one means a different input or converter.
+WANT=7fad9779c58b107e51e8945aa8891d0bf5a2b66afbc2499adc4b45c161d275a9
+DEMO_SEED=4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c
+MODEL="$CACHE/stories15M.lmod"
+if [ ! -f "$MODEL" ] || [ "$(cat "$MODEL.digest" 2>/dev/null)" != "$WANT" ]; then
+    digest=$(cd tools/mkmodel && cargo run -q --release --target "$HOST" -- \
+        "$CACHE/stories15M.bin" "$CACHE/tokenizer.bin" "$MODEL" --seed "$DEMO_SEED" --name stories15M)
+    [ "$digest" = "$WANT" ] || { echo "get-model: the model converted to $digest, not $WANT" >&2; exit 1; }
     echo "$digest" > "$MODEL.digest"
 fi
 echo "$MODEL"

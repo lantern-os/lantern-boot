@@ -5,6 +5,11 @@
 **Roadmap:** Phase 3 closed and Phase 4 (hardware and assurance) opened, 2026-11-16, per [RFC-0036](../lantern-rfcs/rfcs/0036-phase-3-to-phase-4-transition.md)/[ADR-0041](../lantern-rfcs/adr/0041-phase-3-complete-phase-4-opened.md).
 
 ## Done
+- **Signed models and the archive (2026-11-19, [RFC-0038](../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md)/[ADR-0043](../lantern-rfcs/adr/0043-signed-models-and-kept-audit-history.md)).** The inference service accepts only a model package a trusted
+  publisher signed (`assets/model.digest` removed); `tools/mkmodel` signs, and can `--repackage`; `get-model.sh` pins
+  the conversion's digest and makes `stories15M.lmod`. The system image adds the archiver, and `lantern-mkdisk` an 18
+  MiB archive partition (`--no-archive` leaves it out); the volume serves it under `ARCHIVE`; the keystore grants the
+  archiver a sealing key, and doesn't audit its sealing. Boot test feature `audit-ring-test`. console-matrix: 36 cases.
 - Boot flow and trust chain sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
 - Boot-integrity threat model drafted and reviewed.
 - **First loader code merged and running under real QEMU** (`src/`, `riscv64` only —
