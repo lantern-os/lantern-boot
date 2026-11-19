@@ -16,6 +16,7 @@ cd "$(dirname "$0")/.." || exit 2
 SDK="${LANTERN_SDK:-../lantern-sdk}"
 SHELL_REPO="${LANTERN_SHELL:-../lantern-shell}"
 TARGET=target/riscv64gc-unknown-none-elf/release
+HOST=$(rustc -vV | sed -n 's/^host: //p')
 WORK=$(mktemp -d)
 mkdir -p "$WORK/keep"
 cp assets/probe.lpkg assets/fs-probe.lpkg "$WORK/keep/"
@@ -45,7 +46,12 @@ POLICY_SECTORS=4096
 (cd "$SDK" && cargo build -q --example resign) || exit 2
 RESIGN="$SDK/target/debug/examples/resign"
 (cd "$SHELL_REPO/policy-store" && cargo build -q --example audit-dump --target x86_64-unknown-linux-gnu) || exit 2
-DUMP="$SHELL_REPO/policy-store/target/x86_64-unknown-linux-gnu/debug/examples/audit-dump"
+DUMP_FULL="$SHELL_REPO/policy-store/target/x86_64-unknown-linux-gnu/debug/examples/audit-dump"
+# RFC-0038's small audit sectors (`audit-ring-test`) need a dump that reads them.
+(cd "$SHELL_REPO/policy-store" && cargo build -q --example audit-dump --target x86_64-unknown-linux-gnu \
+    --features small-audit-sectors --target-dir target/small-audit) || exit 2
+DUMP_SMALL="$SHELL_REPO/policy-store/target/small-audit/x86_64-unknown-linux-gnu/debug/examples/audit-dump"
+DUMP=$DUMP_FULL
 
 OUT="$WORK/console"
 failures=0
@@ -59,9 +65,10 @@ fail() {
 boot() {
     # A new disk unless KEEP is set. With NEW_DISK as well, only the packages are rewritten: the store's files and the
     # policy store's remembered decisions stay, as they would on a machine given new packages.
+    case "${FEATURES:-}" in *audit-ring-test*) DUMP=$DUMP_SMALL ;; *) DUMP=$DUMP_FULL ;; esac
     if [ -z "${KEEP:-}" ]; then
         "$MKDISK" --out "$DISK" --package assets/probe.lpkg --package assets/fs-probe.lpkg \
-            --package assets/file-assistant.lpkg ${MODEL:+--model "$MODEL"} >/dev/null || exit 2
+            --package assets/file-assistant.lpkg ${MODEL:+--model "$MODEL"} ${NO_ARCHIVE:+--no-archive} >/dev/null || exit 2
     elif [ -n "${NEW_DISK:-}" ]; then
         "$MKDISK" --update --out "$DISK" --package assets/probe.lpkg --package assets/fs-probe.lpkg \
             --package assets/file-assistant.lpkg >/dev/null || exit 2
@@ -187,9 +194,9 @@ FAILED='lantern: "confined-probe" stopped with an error.'
 FS_DONE='lantern: "confined-fs-probe" finished.'
 # A granted app's grants end with it (RFC-0029).
 ENDED='REVOKING:APP_ENDED'
-# Every boot: the keystore grants the store its sealing key, and the wallet its own (RFC-0035), once each, as fixed
-# infrastructure (RFC-0029's system profile).
-START='BOOT SERVICE_GRANTED SERVICE_GRANTED'
+# Every boot: the keystore grants the store its sealing key, the wallet its own (RFC-0035) and the archiver its own
+# (RFC-0038), once each, as fixed infrastructure (RFC-0029's system profile).
+START='BOOT SERVICE_GRANTED SERVICE_GRANTED SERVICE_GRANTED'
 # The filesystem app's run, as the store and the keystore record it: its reads and writes, the store's own sealing and
 # unsealing of each through its keystore grant, and (RFC-0031) the sealing of the store's image after its write.
 FS_USES='USING USING USING USING USING USING USING USING'
@@ -449,7 +456,7 @@ grep -aqF 'the language model role "writer": generate' "$OUT" || fail 'the model
 type_line 'read 2' && expect "  $CONTINUED"
 type_line files && expect '  file 1  46 bytes   written by you, at the console, write 1, boot 1' &&
     expect "  file 2  218 bytes   written by $AGENT, write 2, boot 1"
-type_line 'audit 30' && expect 'USING            the language model generate (model 7fad9779, up to 64 tokens, 46-byte prompt)' &&
+type_line 'audit 30' && expect 'USING            the language model generate (model 7fad9779 by publisher 9273, up to 64 tokens, 46-byte prompt)' &&
     expect 'USING            filesystem write file 1 (you, at the console)' &&
     expect 'USING            filesystem read file 2 (you, at the console)'
 stop
@@ -482,10 +489,11 @@ stop
 audit_is "$START $WRITTEN $AGENT_GRANTS $AGENT_USES $ENDED $ENDED $ENDED"
 ok
 
-case_ "a model that is not the one this system was built with is refused"
-cp "$MODEL_FILE" "$WORK/changed.lmodel"
-printf '\x01' | dd of="$WORK/changed.lmodel" bs=1 seek=100000 conv=notrunc 2>/dev/null
-MODEL="$WORK/changed.lmodel" boot
+# RFC-0038: a model is used only if a trusted publisher signed it, and exactly it.
+case_ "a model changed after it was signed is refused"
+cp "$MODEL_FILE" "$WORK/changed.lmod"
+printf '\x01' | dd of="$WORK/changed.lmod" bs=1 seek=100000 conv=notrunc 2>/dev/null
+MODEL="$WORK/changed.lmod" boot
 type_line "write 1 $TALE" && expect 'written, as you.'
 asked=0
 run file-assistant && ask_and_answer y y y
@@ -495,6 +503,36 @@ stop
 # The call is recorded, then refused: the service has no model to run.
 audit_is "$START $WRITTEN $AGENT_GRANTS USING USING USING USE_FAILED:FAILED $ENDED $ENDED $ENDED"
 ok
+
+
+case_ "a model signed by a publisher the system doesn't trust is refused"
+(cd tools/mkmodel && cargo run -q --release --target "$HOST" -- --repackage "$MODEL_FILE" "$WORK/untrusted.lmod" \
+    --seed 9999999999999999999999999999999999999999999999999999999999999999 --name stories15M) >/dev/null || exit 2
+MODEL="$WORK/untrusted.lmod" boot
+type_line "write 1 $TALE" && expect 'written, as you.'
+asked=0
+run file-assistant && ask_and_answer y y y
+expect "$AGENT_FAILED"
+type_line files && expect '  file 2  0 bytes  never written'
+stop
+# The call is recorded, then refused: the service has no model to run.
+audit_is "$START $WRITTEN $AGENT_GRANTS USING USING USING USE_FAILED:FAILED $ENDED $ENDED $ENDED"
+ok
+
+
+case_ "a model that isn't a signed package is refused"
+python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); open(sys.argv[2],"wb").write(d[512:-64])' "$MODEL_FILE" "$WORK/bare.lmodel"
+MODEL="$WORK/bare.lmodel" boot
+type_line "write 1 $TALE" && expect 'written, as you.'
+asked=0
+run file-assistant && ask_and_answer y y y
+expect "$AGENT_FAILED"
+type_line files && expect '  file 2  0 bytes  never written'
+stop
+# The call is recorded, then refused: the service has no model to run.
+audit_is "$START $WRITTEN $AGENT_GRANTS USING USING USING USE_FAILED:FAILED $ENDED $ENDED $ENDED"
+ok
+
 
 case_ 'a disk with no model: the same refusal'
 MODEL= boot
@@ -566,6 +604,59 @@ expect 'lantern: too late: that request timed out, and was refused.'
 grep -aqF 'lantern: allowed' "$OUT" && fail 'a late answer was reported as counting'
 stop
 audit_is "$START DECLINED:NO_CONSENT"
+ok
+
+# RFC-0038: audit history kept before it's retired. The `audit-ring-test` feature makes each audit sector 63 records, so
+# a few hundred records fill the ring of six and wrap it. Each `write` from the console records several.
+# fill_audit <n>: writes file 1 n times, waiting for each.
+fill_audit() {
+    local done
+    done=$(grep -ac 'written, as you' "$OUT")
+    for i in $(seq 1 "$1"); do
+        type_line "write 1 line $i"
+        expect 'written, as you' $((done + i)) >/dev/null || return 1
+    done
+}
+
+# The archive's first slot's first sealed sector, on a disk `lantern-mkdisk` made without a model or an EFI partition.
+ARCHIVE_SECTOR=108544
+
+case_ 'audit history is kept in the archive before it is retired, and reads back after a reboot'
+FEATURES=audit-ring-test boot
+fill_audit 150
+type_line 'audit 400' && expect 'older ones retired'
+expect 'all kept in the archive'
+grep -aqF 'were never kept' "$OUT" && fail 'history was lost with the archiver running'
+type_line archive && expect '  #0 to #62' && expect '  #63 to #125'
+type_line 'archive 0' && expect '  #0      BOOT' && expect '  #1      SERVICE_GRANTED'
+stop
+FEATURES=audit-ring-test KEEP=1 boot
+type_line 'archive 0' && expect '  #0      BOOT'
+type_line 'archive 63' && expect '  #63 '
+stop
+ok
+
+case_ 'a disk without an archive: retired history is recorded as lost, and nothing else changes'
+FEATURES=audit-ring-test NO_ARCHIVE=1 boot
+fill_audit 150
+type_line 'audit 400' && expect 'older ones retired'
+expect 'were never kept: lost'
+grep -aqF 'all kept in the archive' "$OUT" && fail 'history kept with no archive'
+type_line archive && expect '  the archive holds nothing'
+type_line 'write 2 still working' && expect 'written, as you.'
+stop
+ok
+
+case_ 'a changed byte in the archive is caught, and nothing from it is shown'
+FEATURES=audit-ring-test boot
+fill_audit 60
+type_line archive && expect '  #0 to #62'
+stop
+printf '\x01' | dd of="$DISK" bs=1 seek=$(( (ARCHIVE_SECTOR + 1) * 512 + 300 )) conv=notrunc 2>/dev/null
+FEATURES=audit-ring-test KEEP=1 boot
+type_line 'archive 0' && expect 'does NOT verify. It isn'"'"'t shown.'
+grep -aqF '  #0      BOOT' "$OUT" && fail 'a record from a changed export was shown'
+stop
 ok
 
 [ "$failures" -eq 0 ] && echo 'all matched' || { echo "$failures mismatched"; exit 1; }

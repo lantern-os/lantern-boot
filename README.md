@@ -45,7 +45,8 @@ To try the local AI agent ([RFC-0034](https://github.com/lantern-os/lantern-rfcs
 > run file-assistant        (it asks for file 1, file 2 and the language model: answer each)
 > read 2                    the model's continuation, written by the assistant
 > files                     who wrote each file
-> audit 20                  every use of each grant, including which model ran
+> audit 20                  every use of each grant, including which model ran and whose it was
+> archive                   audit history kept after the log retired it, sealed on the disk
 ```
 
 The model is small (15 million parameters, trained on children's stories), so it continues text rather than following
@@ -78,7 +79,8 @@ the roadmap's next step.
   interactive system; the others are demos).
 - `efi-loader/` — the UEFI application that starts the boot image from the disk.
 - `blk-driver/`, `volume/`, `keystore-service/`, `store-service/`, `inference-service/`, `rng-driver/`, `net-driver/`,
-  `net/`, `wallet/` — confined system programs; `virtio/` is the newer drivers' shared virtio code.
+  `net/`, `wallet/` — confined system programs; `virtio/` is the newer drivers' shared virtio code. The archiver, which
+  keeps audit history, is in `lantern-shell`.
 - `tools/mkdisk/`, `tools/elf2efi/`, `tools/mkmodel/`, `tools/peer/` — host tools that write the disk, build the EFI
   loader, convert the model, and stand in for a network peer.
 - `scripts/` — the QEMU suites, `make-image.sh`, and `get-model.sh`.

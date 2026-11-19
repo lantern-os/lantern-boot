@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! lantern-mkdisk --out <disk.img> [--size-mib <n>] --package <a.lpkg> [--package <b.lpkg> ...]
-//!                [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>] [--model <m.lmodel>]
+//!                [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>] [--model <m.lmod>]
 //! ```
 //!
 //! Writes a raw image: a GPT (`lantern_abi::gpt`) with partitions each aligned to 1 MiB:
@@ -15,9 +15,11 @@
 //! - the **policy store's** log, 2 MiB of `0xFF`, which is erased flash to it;
 //! - the **wallet's** partition, 1 MiB, zeroed, so the wallet makes its root on first start
 //!   ([RFC-0035](../../../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md));
+//! - the **audit archive**, 18 MiB, zeroed: 64 empty slots for the archiver
+//!   ([RFC-0038](../../../../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md));
 //! - with `--model` ([RFC-0034](../../../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md)), the
-//!   **model**, 32 MiB: an `LMODEL01` file from `lantern-mkmodel`, which the inference service checks against the digest
-//!   it was built with. A disk is 128 MiB unless `--size-mib` says otherwise.
+//!   **model**, 32 MiB: a signed model package from `lantern-mkmodel` (RFC-0038), which the inference service checks against
+//!   the system's trusted publishers before using it. A disk is 128 MiB unless `--size-mib` says otherwise.
 //!
 //! `--update` rewrites only the packages partition of the disk at `--out`, and leaves everything else on it, including the
 //! store's files and the policy store's log: how a disk gets new packages without losing what's on it. With `--model`, it
@@ -43,6 +45,8 @@ const ESP_SECTORS: u64 = 32 * ALIGN;
 const POLICY_SECTORS: u64 = 2 * ALIGN;
 const MODELS_SECTORS: u64 = 32 * ALIGN;
 const WALLET_SECTORS: u64 = ALIGN;
+/// RFC-0038's audit archive: 64 slots, each a sealed audit sector.
+const ARCHIVE_SECTORS: u64 = lantern_abi::archive::PARTITION_SECTORS;
 /// Each package must fit, with its length, in the 2 MiB a reader keeps it in (`lantern_abi::launcher::SET_STRIDE`).
 const PACKAGE_MAX: usize = lantern_abi::launcher::SET_STRIDE - lantern_abi::launcher::SET_HEADER;
 
@@ -58,15 +62,17 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let usage = "lantern-mkdisk --out <disk.img> [--size-mib <n>] --package <a.lpkg> [--package <b.lpkg> ...] \
-                 [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>] [--model <m.lmodel>] [--update]";
+                 [--bootable --loader <BOOTRISCV64.EFI> --boot-image <lantern-boot-system>] [--model <m.lmod>] [--no-archive] [--update]";
     let (mut out, mut size_mib, mut paths, mut bootable, mut loader, mut boot_image) = (None, None, Vec::new(), false, None, None);
     let mut model = None;
+    let mut no_archive = false;
     let mut update = false;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
-        if flag == "--bootable" || flag == "--update" {
+        if flag == "--bootable" || flag == "--update" || flag == "--no-archive" {
             bootable |= flag == "--bootable";
             update |= flag == "--update";
+            no_archive |= flag == "--no-archive";
             continue;
         }
         let value = args.next().ok_or(usage)?;
@@ -108,7 +114,12 @@ fn run() -> Result<(), String> {
     // After every partition there was before it, so the others stay where they were.
     let models = Extent { first: policy.first + policy.sectors, sectors: MODELS_SECTORS };
     let wallet = Extent { first: models.first + models.sectors, sectors: WALLET_SECTORS };
+    let archive = Extent { first: wallet.first + wallet.sectors, sectors: ARCHIVE_SECTORS };
     partitions.push((gpt::WALLET_TYPE, wallet, "lantern-wallet"));
+    // RFC-0038's archive; `--no-archive` leaves it out, as a disk made before it has none.
+    if !no_archive {
+        partitions.push((gpt::ARCHIVE_TYPE, archive, "lantern-archive"));
+    }
     if model.is_some() {
         partitions.push((gpt::MODELS_TYPE, models, "lantern-models"));
     }

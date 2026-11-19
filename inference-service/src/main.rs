@@ -1,16 +1,17 @@
 //! `lantern-inference-service` — [RFC-0034](../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md)'s
 //! local inference: a language model behind a capability.
 //!
-//! 1. **Its model, from its own partition.** It reads the `LMODEL01` file from the disk's model partition through the
-//!    volume (badge `MODELS`, read-only) into its heap, and checks the whole file's BLAKE3 digest against
-//!    [`MODEL_DIGEST`], compiled in from `assets/model.digest`. Only a file that matches is parsed. A missing, changed or
-//!    malformed model leaves the service running and refusing every call `FAILED`, so an agent's call fails and is
-//!    recorded, rather than the system stopping.
+//! 1. **Its model, from its own partition, signed.** It reads a model package (`lantern_sdk::model`,
+//!    [RFC-0038](../../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md)) from the disk's model partition
+//!    through the volume (badge `MODELS`, read-only) into its heap, and checks its signature against the system's trusted
+//!    publishers (`lantern_abi::publishers`), the ones the binder trusts apps from. Only a model a trusted publisher signed
+//!    is parsed. A missing, unsigned, changed or malformed one leaves the service running and refusing every call
+//!    `FAILED`, so an agent's call fails and is recorded, rather than the system stopping.
 //! 2. **Grants, from the binder only.** `GRANT` under `GRANTER_BADGE` mints a fresh badge on this program's endpoint for
 //!    object 0 (the model) and op `generate`, tied to the app slot's channel the binder names. `REVOKE` ends one at once.
 //! 3. **`GENERATE`, recorded first.** Each call on a live badge is recorded in the audit log through
-//!    [`policy::audited`] before the model runs: the badge, the model's digest prefix, the tokens asked for and the
-//!    prompt's length. A call the log can't take doesn't run. Generation is greedy, so it's repeatable.
+//!    [`policy::audited`] before the model runs: the badge, the model's publisher and digest prefix, the tokens asked for
+//!    and the prompt's length. A call the log can't take doesn't run. Generation is greedy, so it's repeatable.
 //!
 //! It holds no store, network or console capability: it sees prompts, and can only answer the caller.
 //!
@@ -27,6 +28,8 @@ use lantern_abi::grant::{self, Incoming, APP_SLOTS};
 use lantern_inference_service::Grants;
 use lantern_abi::inference;
 use lantern_abi::policy::{self, AuditEntry};
+use lantern_abi::publishers;
+use lantern_sdk::model as package;
 use lantern_abi::sys::{self, Received};
 use lantern_abi::wire::Rights;
 use lantern_ai_runtime::engine::{generate, Request, Sampler, Workspace};
@@ -56,30 +59,6 @@ const HEAP_VADDR: usize = 0x8620_0000;
 const MEGAPAGE: usize = 0x20_0000;
 const HEAP_SHIFT: usize = 16;
 
-/// The model this image runs: the BLAKE3 digest of its `LMODEL01` file, as `lantern-mkmodel` printed it.
-const MODEL_DIGEST: [u8; 32] = hex(include_str!("../../assets/model.digest"));
-/// Its first 4 bytes, for the audit log.
-const MODEL_ID: u32 = u32::from_be_bytes([MODEL_DIGEST[0], MODEL_DIGEST[1], MODEL_DIGEST[2], MODEL_DIGEST[3]]);
-
-const fn nibble(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        _ => panic!("assets/model.digest holds lowercase hex"),
-    }
-}
-
-const fn hex(text: &str) -> [u8; 32] {
-    let b = text.as_bytes();
-    assert!(b.len() >= 64, "assets/model.digest holds 64 hex digits");
-    let mut out = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        out[i] = nibble(b[2 * i]) << 4 | nibble(b[2 * i + 1]);
-        i += 1;
-    }
-    out
-}
 
 /// Grants, with the minting and the replies the decisions in `lantern_inference_service` don't make.
 trait Serve {
@@ -145,6 +124,9 @@ fn serve_control(grants: &mut Grants, received: &Received) {
 
 /// The model, ready to run.
 struct Engine {
+    /// The model's BLAKE3 digest's first 4 bytes, and its publisher's key's first 2: how the audit log names it.
+    id: u32,
+    publisher: u16,
     model: Model<'static>,
     tokenizer: Tokenizer<'static>,
     workspace: Workspace<'static>,
@@ -157,7 +139,8 @@ struct Engine {
 enum NoModel {
     Unreadable,
     TooLarge,
-    WrongDigest,
+    /// Not a model package, or no trusted publisher signed it.
+    Untrusted,
     Malformed(model::ModelError),
     NoRoom,
 }
@@ -180,11 +163,11 @@ fn carve<T: Copy>(rest: &mut &'static mut [u8], n: usize, zero: T) -> Option<&'s
     Some(slice)
 }
 
-/// Reads the model into the heap, checks its digest, and sets the engine up after it.
+/// Reads the model package into the heap, checks a trusted publisher signed it, and sets the engine up after it.
 fn load(volume: &mut Client, heap: &'static mut [u8]) -> Result<Engine, NoModel> {
     let mut header = [0u8; SECTOR];
     volume.read(0, &mut header).map_err(|_| NoModel::Unreadable)?;
-    let len = model::file_len(&header).map_err(NoModel::Malformed)?;
+    let len = package::package_len(&header[..package::MODEL_OFFSET]).map_err(|_| NoModel::Untrusted)?;
     let read_len = len.div_ceil(block::MAX_BYTES) * block::MAX_BYTES;
     if read_len > heap.len() {
         return Err(NoModel::TooLarge);
@@ -194,9 +177,12 @@ fn load(volume: &mut Client, heap: &'static mut [u8]) -> Result<Engine, NoModel>
         volume.read((i * block::MAX_SECTORS) as u64, chunk).map_err(|_| NoModel::Unreadable)?;
     }
     let file: &'static [u8] = &file[..len];
-    if !lantern_crypto::hash::hash(file).ct_eq(&lantern_crypto::hash::Hash::from_bytes(MODEL_DIGEST)) {
-        return Err(NoModel::WrongDigest);
-    }
+    let package = package::decode_model(file).map_err(|_| NoModel::Untrusted)?;
+    let publisher = publishers::TRUSTED.iter().find(|key| package.verify(key).is_ok()).ok_or(NoModel::Untrusted)?;
+    let digest = lantern_crypto::hash::hash(package.model);
+    let d = digest.as_bytes();
+    let (id, publisher) = (u32::from_be_bytes([d[0], d[1], d[2], d[3]]), publishers::short(publisher));
+    let file = package.model;
     let model = model::parse(file).map_err(NoModel::Malformed)?;
     let c = model.config;
     let (floats, bytes) = Workspace::sizes(&c);
@@ -208,7 +194,7 @@ fn load(volume: &mut Client, heap: &'static mut [u8]) -> Result<Engine, NoModel>
     let workspace = Workspace::new(&c, floats, bytes).ok_or(NoModel::NoRoom)?;
     let tokenizer =
         Tokenizer::new(model.tokenizer, c.vocab_size, offsets, sorted).map_err(NoModel::Malformed)?;
-    Ok(Engine { model, tokenizer, workspace, tokens })
+    Ok(Engine { id, publisher, model, tokenizer, workspace, tokens })
 }
 
 /// `GENERATE` on `request`: the continuation into `reply`. `INVALID` for a request over the limits or a prompt that fills
@@ -269,9 +255,12 @@ fn run(arg0: usize) -> ! {
         } else {
             let prompt_len = len.saturating_sub(inference::HEADER);
             let max_tokens = request.get(..2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize);
+            // Which model: its publisher, and its digest's prefix. With none loaded, both are 0.
+            let (id, publisher) = engine.as_ref().map_or((0, 0), |e| (e.id, e.publisher));
             let using = AuditEntry {
                 ops: inference::GENERATE,
-                subject: [badge, inference::audit_subject(MODEL_ID, max_tokens, prompt_len)],
+                object: publisher,
+                subject: [badge, inference::audit_subject(id, max_tokens, prompt_len)],
                 ..AuditEntry::default()
             };
             let mut run = || serve_generate(engine.as_mut(), &request[..len], &mut reply);

@@ -95,6 +95,8 @@ lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch 
 # `binder-matrix.sh` only: lowers the policy store's per-grant quota of operation records to 1, so the quota
 # case runs in seconds (RFC-0025). It can only lower it.
 audit-quota-test = []
+# RFC-0038's console matrix: small audit sectors, so the ring fills and the archiver exports within a test.
+audit-ring-test = []
 # `scripts/irq-demo.sh` only: the irq demo's spinner parks instead of spinning, so the kernel must idle (RFC-0027).
 irq-idle = []
 # `scripts/console-matrix.sh` only: lowers the system image's consent limit from 60 to 2 seconds (RFC-0028). It can only

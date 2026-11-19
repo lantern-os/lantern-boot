@@ -37,6 +37,9 @@
 //!   peer over an encrypted session. Without `-device virtio-rng-device` and
 //!   `-netdev user,id=net -device virtio-net-device,netdev=net`, the drivers refuse every request, and the wallet every
 //!   session; nothing else changes.
+//! - **`archiver`** ([RFC-0038](../../../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md)): keeps audit
+//!   history before the policy store retires it, sealed under its own keystore key, in the disk's archive partition, and
+//!   reads it back for the shell. The policy store wakes it, without blocking, while a full sector waits.
 //!
 //! **This image needs a disk** from `lantern-mkdisk`, as virtio-blk on virtio-mmio, modern:
 //! `-global virtio-mmio.force-legacy=false -drive if=none,format=raw,file=<disk.img>,id=disk -device virtio-blk-device,drive=disk`.
@@ -59,7 +62,12 @@ const STORE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/store-service.elf"
 const CONFINED_RUNTIME_ELF: &[u8] = include_bytes!("../../assets/confined-runtime.elf");
 const LAUNCH_BINDER_ELF: &[u8] = include_bytes!("../../assets/launch-binder.elf");
 const LAUNCHER_ELF: &[u8] = include_bytes!("../../assets/launcher.elf");
+#[cfg(not(feature = "audit-ring-test"))]
 const POLICY_STORE_ELF: &[u8] = include_bytes!("../../assets/policy-store.elf");
+/// RFC-0038's console matrix: the policy store and archiver built with `small-audit-sectors`, so the audit ring fills,
+/// exports and wraps within a test. Never in a real image.
+#[cfg(feature = "audit-ring-test")]
+const POLICY_STORE_ELF: &[u8] = include_bytes!("../../assets/policy-store-small-audit.elf");
 const SHELL_ELF: &[u8] = include_bytes!("../../assets/shell.elf");
 const BLK_DRIVER_ELF: &[u8] = include_bytes!("../../assets/blk-driver.elf");
 const VOLUME_ELF: &[u8] = include_bytes!("../../assets/volume.elf");
@@ -68,6 +76,10 @@ const RNG_DRIVER_ELF: &[u8] = include_bytes!("../../assets/rng-driver.elf");
 const NET_DRIVER_ELF: &[u8] = include_bytes!("../../assets/net-driver.elf");
 const NET_ELF: &[u8] = include_bytes!("../../assets/net.elf");
 const WALLET_ELF: &[u8] = include_bytes!("../../assets/wallet.elf");
+#[cfg(not(feature = "audit-ring-test"))]
+const ARCHIVER_ELF: &[u8] = include_bytes!("../../assets/archiver.elf");
+#[cfg(feature = "audit-ring-test")]
+const ARCHIVER_ELF: &[u8] = include_bytes!("../../assets/archiver-small-audit.elf");
 
 /// `blk-driver/src/main.rs`'s and `volume/src/main.rs`'s slots, and their channels.
 const DRIVER_ENDPOINT: CPtr = 1;
@@ -194,6 +206,30 @@ const KEYSTORE_WALLET_CHANNEL: usize = APP_SLOTS + 1;
 
 /// `policy-store`'s panic report.
 const POLICY_STORE_FAILURE_CPTR: CPtr = 4;
+/// [RFC-0038](../../../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md): `policy-store`'s flag for an
+/// archiver, its slot for waking it, and the page it shares with it.
+const POLICY_STORE_WITH_ARCHIVER: usize = 1 << 21;
+const POLICY_STORE_ARCHIVER_WAKE: CPtr = 6;
+const POLICY_STORE_ARCHIVER_PAGE_VADDR: usize = 0x9002_0000;
+/// `lantern-shell/archiver`'s slots and addresses.
+const A_ENDPOINT: CPtr = 1;
+const A_POLICY: CPtr = 2;
+const A_KEYSTORE: CPtr = 3;
+const A_VOLUME: CPtr = 5;
+const A_FAILURE: CPtr = 6;
+const A_POLICY_PAGE_VADDR: usize = 0x9001_0000;
+const A_VOLUME_VADDR: usize = 0x9002_0000;
+const A_KEYSTORE_VADDR: usize = 0x9003_0000;
+/// `lantern_abi::policy::ARCHIVER_BADGE` and `ARCHIVER_WAKE_BADGE`, `lantern_abi::archive::KEYSTORE_BADGE` and
+/// `READER_BADGE`, and the volume's `ARCHIVE` badge.
+const ARCHIVER_POLICY_BADGE: u64 = launch::READER_BADGE - 5;
+const ARCHIVER_WAKE_BADGE: u64 = 2;
+const ARCHIVER_KEYSTORE_BADGE: u64 = launch::GRANTER_BADGE - 2;
+const ARCHIVER_READER_BADGE: u64 = 1;
+const VOLUME_BADGE_ARCHIVE: u64 = 7;
+/// The keystore's channel for the archiver, after the wallet's; and the shell's slot for reading the archive.
+const KEYSTORE_ARCHIVER_CHANNEL: usize = APP_SLOTS + 2;
+const SHELL_ARCHIVE_READER_CPTR: CPtr = 14;
 /// `launch-binder`'s own CNode, with a launcher.
 const BINDER_SELF_CNODE_CPTR: CPtr = 15;
 
@@ -325,6 +361,12 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let volume_policy = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_POLICY);
     let volume_models = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_MODELS);
     let volume_wallet = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_WALLET);
+    // RFC-0038: the archiver's endpoint, with the policy store's badge for waking it and the shell's for reading; its badges
+    // on the volume, the policy store and the keystore.
+    let volume_archive = mint(state, &mut next_slot, volume_endpoint, Rights::WRITE, VOLUME_BADGE_ARCHIVE);
+    let archiver_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
+    let archiver_wake = mint(state, &mut next_slot, archiver_endpoint, Rights::WRITE, ARCHIVER_WAKE_BADGE);
+    let archiver_reader = mint(state, &mut next_slot, archiver_endpoint, Rights::WRITE, ARCHIVER_READER_BADGE);
     let (blk_paddr, blk_line) = launch::find_virtio_blk().expect("no virtio-blk device: this image needs a disk");
     let driver_notification = retype(state, &mut next_slot, ObjectType::Notification);
     let driver_notify = mint(state, &mut next_slot, driver_notification, Rights::ALL, 1);
@@ -347,6 +389,8 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let inference_writer = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, launch::INFERENCE_WRITER_BADGE);
     let wallet_writer = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, WALLET_WRITER_BADGE);
     let keystore_for_wallet = mint(state, &mut next_slot, endpoint, Rights::WRITE, WALLET_KEYSTORE_BADGE);
+    let policy_archiver = mint(state, &mut next_slot, policy_endpoint, Rights::WRITE, ARCHIVER_POLICY_BADGE);
+    let keystore_for_archiver = mint(state, &mut next_slot, endpoint, Rights::WRITE, ARCHIVER_KEYSTORE_BADGE);
     // The drivers' devices, lines and DMA memory, if the machine has them; `net`'s notification, where the network card's
     // interrupt goes, and its deadline.
     let rng_device = launch::find_virtio(VIRTIO_RNG);
@@ -419,6 +463,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
         (store_reader, SHELL_STORE_READER_CPTR),
         (store_console, SHELL_STORE_CONSOLE_CPTR),
         (wallet_reader, SHELL_WALLET_READER_CPTR),
+        (archiver_reader, SHELL_ARCHIVE_READER_CPTR),
     ];
     let mut launcher_grants = [(0, 0); 5 + 7 * APP_SLOTS];
     let fixed = [
@@ -513,11 +558,12 @@ pub unsafe fn run(mem_end: usize) -> ! {
         },
         ProgramSpec {
             elf_bytes: POLICY_STORE_ELF,
-            arg0: launch::POLICY_STORE_QUOTA | POLICY_STORE_ON_DISK,
+            arg0: launch::POLICY_STORE_QUOTA | POLICY_STORE_ON_DISK | POLICY_STORE_WITH_ARCHIVER,
             grants: &[
                 (policy_endpoint, launch::POLICY_STORE_ENDPOINT_CPTR),
                 (system_failed_bit, POLICY_STORE_FAILURE_CPTR),
                 (volume_policy, POLICY_STORE_VOLUME),
+                (archiver_wake, POLICY_STORE_ARCHIVER_WAKE),
             ],
             self_cnode_dest: None,
             heap_megapages: POLICY_STORE_MIRROR_MEGAPAGES,
@@ -605,8 +651,22 @@ pub unsafe fn run(mem_end: usize) -> ! {
             heap_megapages: 0,
             arena: None,
         },
+        ProgramSpec {
+            elf_bytes: ARCHIVER_ELF,
+            arg0: 0,
+            grants: &[
+                (archiver_endpoint, A_ENDPOINT),
+                (policy_archiver, A_POLICY),
+                (keystore_for_archiver, A_KEYSTORE),
+                (volume_archive, A_VOLUME),
+                (system_failed_bit, A_FAILURE),
+            ],
+            self_cnode_dest: None,
+            heap_megapages: 0,
+            arena: None,
+        },
     ];
-    let [shell, keystore, store, binder, launcher, policy_store, driver, volume, inference, rng_driver, net_driver, net, wallet] =
+    let [shell, keystore, store, binder, launcher, policy_store, driver, volume, inference, rng_driver, net_driver, net, wallet, archiver] =
         launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
     launch::map_small_device_frame(state, root, UART_PADDR, shell.vspace_cptr, SHELL_UART_VADDR, &mut next_slot);
     // The runtime's ELF, the launcher's alone. The packages are on the disk.
@@ -676,6 +736,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
         (policy_store.vspace_cptr, POLICY_STORE_VOLUME_VADDR, VOLUME_BADGE_POLICY),
         (inference.vspace_cptr, INFERENCE_VOLUME_VADDR, VOLUME_BADGE_MODELS),
         (wallet.vspace_cptr, W_VOLUME_VADDR, VOLUME_BADGE_WALLET),
+        (archiver.vspace_cptr, A_VOLUME_VADDR, VOLUME_BADGE_ARCHIVE),
     ] {
         let at = VOLUME_CLIENT_VADDR + (badge as usize - 1) * CHANNEL_STRIDE;
         share(state, volume.vspace_cptr, at, client, vaddr);
@@ -694,6 +755,10 @@ pub unsafe fn run(mem_end: usize) -> ! {
     share(state, net.vspace_cptr, N_CLIENT_VADDR, wallet.vspace_cptr, W_NET_VADDR);
     let keystore_wallet = KEYSTORE_CHANNEL_VADDR + KEYSTORE_WALLET_CHANNEL * CHANNEL_STRIDE;
     share(state, keystore.vspace_cptr, keystore_wallet, wallet.vspace_cptr, W_KEYSTORE_VADDR);
+    // RFC-0038: the page the policy store copies a sector's words into for the archiver, and the archiver's keystore channel.
+    share(state, policy_store.vspace_cptr, POLICY_STORE_ARCHIVER_PAGE_VADDR, archiver.vspace_cptr, A_POLICY_PAGE_VADDR);
+    let keystore_archiver = KEYSTORE_CHANNEL_VADDR + KEYSTORE_ARCHIVER_CHANNEL * CHANNEL_STRIDE;
+    share(state, keystore.vspace_cptr, keystore_archiver, archiver.vspace_cptr, A_KEYSTORE_VADDR);
     for tcb in [
         keystore.tcb,
         store.tcb,
@@ -707,6 +772,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
         net_driver.tcb,
         net.tcb,
         wallet.tcb,
+        archiver.tcb,
     ] {
         state.make_ready(tcb);
     }
