@@ -17,7 +17,10 @@
 
 use core::ffi::c_void;
 
-use lantern_efi_loader::{place, plan, KERNEL_BASE, KERNEL_SIZE};
+use lantern_efi_loader::{
+    aligned_base, device_tree_size, lowest_fit, place, plan, reserved_ranges, HANDOFF_MAGIC, KERNEL_ALIGN, KERNEL_BASE,
+    KERNEL_SIZE, MAX_RESERVED,
+};
 use r_efi::efi;
 use r_efi::protocols::{file, loaded_image, simple_file_system};
 
@@ -120,14 +123,27 @@ impl Firmware {
         }
     }
 
+    /// The firmware's device tree, copied into pages the loader owns (RFC-0039). The firmware's own copy may be in
+    /// memory it reclaims at `ExitBootServices`, as EDK2's is: the kernel would find it overwritten.
     fn device_tree(&self) -> Result<usize, &'static str> {
         // SAFETY: as `say`: the configuration table and its length are the firmware's.
         let tables = unsafe { core::slice::from_raw_parts((*self.st).configuration_table, (*self.st).number_of_table_entries) };
-        tables
+        let theirs = tables
             .iter()
             .find(|t| t.vendor_guid == efi::DTB_TABLE_GUID)
-            .map(|t| t.vendor_table as usize)
-            .ok_or("the firmware gave no device tree")
+            .map(|t| t.vendor_table as *const u8)
+            .ok_or("the firmware gave no device tree")?;
+        let mut head = [0u8; 8];
+        // SAFETY: the firmware's table points at its device tree, valid until ExitBootServices; its header is 40 bytes.
+        unsafe { core::ptr::copy_nonoverlapping(theirs, head.as_mut_ptr(), 8) };
+        let size = device_tree_size(head).ok_or("the firmware's device tree isn't one")?;
+        let mut at: efi::PhysicalAddress = 0;
+        if (self.bs().allocate_pages)(efi::ALLOCATE_ANY_PAGES, efi::LOADER_DATA, size.div_ceil(PAGE), &mut at).is_error() {
+            return Err("no memory for the device tree");
+        }
+        // SAFETY: `size` bytes of the firmware's tree, into `size.div_ceil(PAGE)` pages just allocated, which don't overlap it.
+        unsafe { core::ptr::copy_nonoverlapping(theirs, at as *mut u8, size) };
+        Ok(at as usize)
     }
 
     fn boot_hart(&self) -> usize {
@@ -147,13 +163,47 @@ impl Firmware {
     }
 
     /// Leaves UEFI. The memory map's key changes whenever the firmware allocates, so it's fetched just before.
-    fn exit(&self) -> Result<(), &'static str> {
+    /// [`lowest_fit`] over the firmware's conventional memory now.
+    fn lowest_free_kernel_range(&self) -> Option<u64> {
+        let mut buf = [0u8; 16384];
+        let (mut size, mut key, mut desc_size, mut version) = (buf.len(), 0usize, 0usize, 0u32);
+        let map = buf.as_mut_ptr() as *mut efi::MemoryDescriptor;
+        if (self.bs().get_memory_map)(&mut size, map, &mut key, &mut desc_size, &mut version).is_error()
+            || desc_size < core::mem::size_of::<efi::MemoryDescriptor>()
+        {
+            return None;
+        }
+        let free = (0..size / desc_size).filter_map(|i| {
+            // SAFETY: the firmware wrote `size` bytes of descriptors, `desc_size` apart, into `buf`; each is read unaligned.
+            let d = unsafe { core::ptr::read_unaligned(buf.as_ptr().add(i * desc_size) as *const efi::MemoryDescriptor) };
+            (d.r#type == efi::CONVENTIONAL_MEMORY).then_some((d.physical_start, d.number_of_pages.checked_mul(PAGE as u64)?))
+        });
+        lowest_fit(free)
+    }
+
+    /// Leaves boot services, first writing into `table` (a page the loader owns: a count, then `(base, size)` pairs)
+    /// what the memory map it leaves with says the kernel must not use.
+    fn exit(&self, table: &mut [u64; 512]) -> Result<(), &'static str> {
         let mut buf = [0u8; 16384];
         for _ in 0..2 {
             let (mut size, mut key, mut desc_size, mut version) = (buf.len(), 0usize, 0usize, 0u32);
             let map = buf.as_mut_ptr() as *mut efi::MemoryDescriptor;
-            if (self.bs().get_memory_map)(&mut size, map, &mut key, &mut desc_size, &mut version).is_error() {
+            if (self.bs().get_memory_map)(&mut size, map, &mut key, &mut desc_size, &mut version).is_error()
+                || desc_size < core::mem::size_of::<efi::MemoryDescriptor>()
+            {
                 return Err("the memory map can't be read");
+            }
+            let descriptors = (0..size / desc_size).map(|i| {
+                // SAFETY: the firmware wrote `size` bytes of descriptors, `desc_size` apart, into `buf`; read unaligned.
+                let d = unsafe { core::ptr::read_unaligned(buf.as_ptr().add(i * desc_size) as *const efi::MemoryDescriptor) };
+                (d.r#type, d.physical_start, d.number_of_pages)
+            });
+            let mut ranges = [(0u64, 0u64); MAX_RESERVED];
+            // Writing into a page already allocated doesn't change the map, so `key` stays good.
+            let n = reserved_ranges(descriptors, &mut ranges).ok_or("the firmware reserves too much to hand over")?;
+            table[0] = n as u64;
+            for (k, &(base, len)) in ranges[..n].iter().enumerate() {
+                (table[1 + 2 * k], table[2 + 2 * k]) = (base, len);
             }
             if !(self.bs().exit_boot_services)(self.image, key).is_error() {
                 return Ok(());
@@ -183,20 +233,42 @@ enum Never {}
 fn boot(firmware: &Firmware) -> Result<Never, &'static str> {
     let elf = firmware.read_boot_image()?;
     let (entry, copies) = plan(elf).map_err(|_| "the boot image isn't one this loader can place")?;
-    let mut at: efi::PhysicalAddress = KERNEL_BASE;
-    let pages = KERNEL_SIZE as usize / PAGE;
-    if (firmware.bs().allocate_pages)(efi::ALLOCATE_ADDRESS, efi::LOADER_DATA, pages, &mut at).is_error() {
-        return Err("the kernel's memory is the firmware's");
-    }
-    // SAFETY: the firmware just gave this whole range to the loader.
-    let kernel = unsafe { core::slice::from_raw_parts_mut(KERNEL_BASE as *mut u8, KERNEL_SIZE as usize) };
+    // The lowest megapage-aligned room in the firmware's free memory (RFC-0039): RAM is wherever the machine has it,
+    // and taking the bottom keeps what's above it one run for the kernel. If the firmware won't give exactly that, any
+    // room it has.
+    let lowest = firmware.lowest_free_kernel_range().filter(|_| !cfg!(feature = "place-high")).filter(|&at| {
+        let mut got = at;
+        !(firmware.bs().allocate_pages)(efi::ALLOCATE_ADDRESS, efi::LOADER_DATA, KERNEL_SIZE as usize / PAGE, &mut got).is_error()
+    });
+    let base = match lowest {
+        Some(at) => at,
+        None => {
+            let mut at: efi::PhysicalAddress = 0;
+            let pages = (KERNEL_SIZE + KERNEL_ALIGN) as usize / PAGE;
+            if (firmware.bs().allocate_pages)(efi::ALLOCATE_ANY_PAGES, efi::LOADER_DATA, pages, &mut at).is_error() {
+                return Err("no memory for the kernel");
+            }
+            aligned_base(at).ok_or("no memory for the kernel")?
+        }
+    };
+    // SAFETY: the firmware just gave the loader a range holding `[base, base + KERNEL_SIZE)`.
+    let kernel = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, KERNEL_SIZE as usize) };
     place(elf, &copies, kernel);
+    let entry = base + (entry - KERNEL_BASE);
     let dtb = firmware.device_tree()?;
     let hart = firmware.boot_hart();
+    // The reserved-range table's page, allocated now: allocating after the last memory map would change it.
+    let mut table_at: efi::PhysicalAddress = 0;
+    if (firmware.bs().allocate_pages)(efi::ALLOCATE_ANY_PAGES, efi::LOADER_DATA, 1, &mut table_at).is_error() {
+        return Err("no memory for the memory map's hand-off");
+    }
+    // SAFETY: a page just allocated to the loader, page-aligned, so aligned for `u64`.
+    let table = unsafe { &mut *(table_at as *mut [u64; 512]) };
     firmware.say(SAY[core::hint::black_box(SAY_STARTING)]);
-    firmware.exit()?;
+    firmware.exit(table)?;
     // SAFETY: UEFI is gone and nothing else runs. Interrupts are masked and paging turned off before the jump, so the
-    // kernel starts as it does from OpenSBI: in S-mode, with the MMU off, `a0` the hart and `a1` the device tree. The
+    // kernel starts as it does from OpenSBI: in S-mode, with the MMU off, `a0` the hart and `a1` the device tree; and `a2`
+    // and `a3` the memory map's hand-off (RFC-0039). The
     // `fence.i` makes the copied code visible to instruction fetch.
     unsafe {
         core::arch::asm!(
@@ -209,6 +281,8 @@ fn boot(firmware: &Firmware) -> Result<Never, &'static str> {
             entry = in(reg) entry,
             in("a0") hart,
             in("a1") dtb,
+            in("a2") HANDOFF_MAGIC,
+            in("a3") table_at,
             options(noreturn)
         )
     }

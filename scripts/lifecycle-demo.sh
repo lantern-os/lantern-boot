@@ -19,7 +19,7 @@ RUNS=${RUNS:-3}
 cargo build -q --release --bin lantern-boot-lifecycle-demo || exit 2
 failures=0
 for run in $(seq 1 "$RUNS"); do
-    qemu-system-riscv64 -machine virt -bios default -nographic -m 128M \
+    qemu-system-riscv64 -machine "${MACHINE:-virt}" ${SMP:+-smp "$SMP"} ${CPU:+-cpu "$CPU"} -bios default -nographic -m 128M \
         -kernel "$TARGET/lantern-boot-lifecycle-demo" </dev/null >"$WORK/out" 2>&1 &
     qemu=$!
     for _ in $(seq 1 300); do

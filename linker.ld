@@ -1,11 +1,14 @@
-/* riscv64 QEMU 'virt' machine, `-bios default` (OpenSBI): OpenSBI itself loads at
- * 0x80000000 and jumps to the "payload" kernel at 0x80200000 in S-mode, per the
- * standard convention essentially every bare-metal riscv64-under-QEMU project
- * relies on. */
+/* Linked for QEMU 'virt', `-bios default` (OpenSBI): OpenSBI itself loads at
+ * 0x80000000 and jumps to the "payload" kernel at 0x80200000 in S-mode. The image
+ * is position-independent (`build.rs`, RFC-0039): loaded anywhere else, as the EFI
+ * loader does on a machine whose RAM is elsewhere, `src/entry.rs` applies its
+ * `.rela.dyn` entries for the difference before anything reads them. */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
 BASE_ADDRESS = 0x80200000;
+/* The link address, as an absolute symbol `src/entry.rs` compares its run address with. */
+__link_base = BASE_ADDRESS;
 
 /* Sv39 megapage size (2 MiB) — `loader.rs` maps this whole image at that
  * granularity (two megapages, S-mode-only — every loaded program's VSpace needs
@@ -25,6 +28,12 @@ SECTIONS
     .text : {
         *(.text._start)
         *(.text .text.*)
+    }
+
+    .rela.dyn : ALIGN(8) {
+        PROVIDE(__rela_dyn_start = .);
+        *(.rela.dyn .rela.dyn.*)
+        PROVIDE(__rela_dyn_end = .);
     }
 
     .rodata : ALIGN(4K) {

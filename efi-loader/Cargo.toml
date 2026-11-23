@@ -25,3 +25,8 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 opt-level = "s"
+
+[features]
+# RFC-0039's relocation test only (`scripts/boot-disk.sh`): place the kernel wherever the firmware's own allocator puts
+# it, away from its link address, instead of the lowest free range. Never in a real loader.
+place-high = []

@@ -12,6 +12,10 @@
 # The console is the shell's alone (RFC-0026), so everything checked here came from the shell. Exits nonzero on any
 # mismatch, restoring the package either way.
 set -u
+# RFC-0039: DISK_BUS=nvme puts the disk on an NVMe controller on QEMU's PCIe bus instead of virtio-mmio.
+disk_device() {
+    if [ "${DISK_BUS:-virtio}" = nvme ]; then echo "-device nvme,serial=lantern,drive=disk"; else echo "-device virtio-blk-device,drive=disk"; fi
+}
 cd "$(dirname "$0")/.." || exit 2
 SDK="${LANTERN_SDK:-../lantern-sdk}"
 SHELL_REPO="${LANTERN_SHELL:-../lantern-shell}"
@@ -78,8 +82,8 @@ boot() {
     granted=$(grants_recorded)
     rm -f "$WORK/in"
     mkfifo "$WORK/in"
-    qemu-system-riscv64 -machine virt -bios default -nographic -m 256M \
-        -global virtio-mmio.force-legacy=false -drive "if=none,format=raw,file=$DISK,id=disk" -device virtio-blk-device,drive=disk \
+    qemu-system-riscv64 -machine "${MACHINE:-virt}" ${SMP:+-smp "$SMP"} ${CPU:+-cpu "$CPU"} -bios default -nographic -m 256M \
+        -global virtio-mmio.force-legacy=false -drive "if=none,format=raw,file=$DISK,id=disk" $(disk_device) \
         -kernel "$TARGET/lantern-boot-system" <"$WORK/in" >"$OUT" 2>&1 &
     QEMU_PID=$!
     exec 3>"$WORK/in"

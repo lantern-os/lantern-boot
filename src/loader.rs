@@ -48,7 +48,7 @@ const ARG0_CLIENT: usize = 1;
 
 /// Sets up the loader's own privileged root identity (one CNode, one TCB never
 /// actually scheduled, one memory-backed Untyped spanning
-/// `pmm::GENERAL_MEMORY_BASE..mem_end`), loads the hello-service ELF twice
+/// `pmm::general_memory_base()..mem_end`), loads the hello-service ELF twice
 /// (server, then client), grants the shared endpoint to each, and cold-starts
 /// the client. Never returns.
 ///
@@ -77,9 +77,9 @@ pub unsafe fn run(mem_end: usize) -> ! {
 
     // Clamp defensively: `mem_end` must be above the fixed low boundary and
     // megapage-aligned down (`Untyped::with_memory`'s range requirement).
-    let mem_end = mem_end.max(pmm::GENERAL_MEMORY_BASE + lantern_hal::RISCV64_MEGAPAGE_SIZE)
+    let mem_end = mem_end.max(pmm::general_memory_base() + lantern_hal::RISCV64_MEGAPAGE_SIZE)
         & !(lantern_hal::RISCV64_MEGAPAGE_SIZE - 1);
-    let untyped = Untyped::with_memory(1000, pmm::GENERAL_MEMORY_BASE, mem_end - pmm::GENERAL_MEMORY_BASE);
+    let untyped = Untyped::with_memory(1000, pmm::general_memory_base(), mem_end - pmm::general_memory_base());
     let untyped_idx = state.untypeds.alloc(untyped).expect("untyped pool exhausted");
     let untyped_cptr: CPtr = 1;
     *state.cnodes.get_mut(root_cnode_idx).unwrap().slot_mut(untyped_cptr).unwrap() =

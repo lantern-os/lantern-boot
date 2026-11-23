@@ -1,32 +1,33 @@
-//! Where this crate's real physical memory lives, as far as `loader.rs` needs to
-//! know it.
+//! Where boot's general-purpose memory lives ([RFC-0039](../../lantern-rfcs/rfcs/0039-bring-up-on-the-k3-pico-itx.md)):
+//! the largest run of RAM the device tree leaves free, outside the firmware's reservations, the device tree itself and
+//! this image's two megapages, megapage-aligned because `Untyped::with_memory` needs it. [`crate::platform::discover`]
+//! sets it, once, before any loader runs; nothing here is assumed about the machine.
 //!
-//! [`GENERAL_MEMORY_BASE`] is a fixed fact tied to `linker.ld` (where the kernel
-//! image and `.user_text` megapages end); it isn't discovered. The **end** of
-//! RAM *is* now discovered — `boot_main` reads it from the device tree
-//! (`src/fdt.rs`) and passes it to `loader::run`. [`GENERAL_MEMORY_END`] below is
-//! only the fallback used when the tree is unreadable: hardcoded facts about
-//! QEMU's `riscv64` `virt` machine at its default RAM size, the same kind of
-//! hardcoded-machine-fact `uart.rs`'s fixed UART0 address is.
-//!
-//! [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
-//! [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md)
-//! moved real physical-memory bookkeeping *into* `lantern-kernel` itself
-//! (`Untyped::bump`, backed by the range below) — this module no longer hands out
-//! frames directly the way an earlier revision did; `loader.rs` seeds one
-//! memory-backed `Untyped` from [`GENERAL_MEMORY_BASE`]/[`GENERAL_MEMORY_END`] at
-//! boot, and every VSpace/Frame (including page-table-internal frames
-//! `FrameInvoke::Map` allocates on demand) comes from retyping that, not a
-//! separate boot-only allocator.
+//! [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md) moved real physical-memory
+//! bookkeeping into `lantern-kernel` (`Untyped::bump`): each loader seeds one memory-backed `Untyped` from this range.
 
-/// Where `linker.ld` ends the two megapages it reserves for the kernel image and
-/// `.user_text` (`0x8020_0000` + 2x [`lantern_hal::RISCV64_MEGAPAGE_SIZE`]) —
-/// hardcoded rather than derived from a linker symbol because
-/// `Untyped::with_memory`'s range must already be megapage-aligned, which a
-/// linker-placed symbol doesn't guarantee.
-pub const GENERAL_MEMORY_BASE: usize = 0x8060_0000;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Fallback end of RAM — `riscv_virt_board.ram` on QEMU's `virt` machine at its
-/// default size (128 MiB). Used only when `src/fdt.rs` can't read the device
-/// tree; the normal path is the tree-reported end.
-pub const GENERAL_MEMORY_END: usize = 0x8800_0000;
+static BASE: AtomicUsize = AtomicUsize::new(0);
+static END: AtomicUsize = AtomicUsize::new(0);
+
+/// Records the range. Called once, by `platform::discover`.
+pub fn set(base: usize, end: usize) {
+    BASE.store(base, Ordering::Relaxed);
+    END.store(end, Ordering::Relaxed);
+}
+
+fn checked(v: usize) -> usize {
+    assert!(v != 0, "boot's memory wasn't set: platform::discover must run first");
+    v
+}
+
+/// The first byte of general memory.
+pub fn general_memory_base() -> usize {
+    checked(BASE.load(Ordering::Relaxed))
+}
+
+/// One past its last byte.
+pub fn general_memory_end() -> usize {
+    checked(END.load(Ordering::Relaxed))
+}

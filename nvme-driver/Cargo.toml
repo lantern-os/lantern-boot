@@ -1,0 +1,22 @@
+[package]
+name = "lantern-nvme-driver"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0039's NVMe driver: a confined riscv64 program holding one NVMe controller's register pages, its IrqHandler and a DMA Untyped for its queues. It serves raw sectors to one client, the volume, as the virtio-blk driver does, and parses nothing from the disk. Loaded by lantern-boot's system image."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-nvme-driver"
+path = "src/main.rs"
+
+[dependencies]
+# Local path in this monorepo; rewrite to `git = "https://github.com/lantern-os/lantern-abi"`
+# when pushing lantern-boot standalone (same split as lantern-kernel -> lantern-hal).
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

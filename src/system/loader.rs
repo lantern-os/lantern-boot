@@ -70,6 +70,10 @@ const POLICY_STORE_ELF: &[u8] = include_bytes!("../../assets/policy-store.elf");
 const POLICY_STORE_ELF: &[u8] = include_bytes!("../../assets/policy-store-small-audit.elf");
 const SHELL_ELF: &[u8] = include_bytes!("../../assets/shell.elf");
 const BLK_DRIVER_ELF: &[u8] = include_bytes!("../../assets/blk-driver.elf");
+/// RFC-0039: the NVMe driver, used in the virtio-blk driver's place when the machine has an NVMe controller.
+const NVME_DRIVER_ELF: &[u8] = include_bytes!("../../assets/nvme-driver.elf");
+/// `nvme-driver/src/main.rs`'s `ARG0_INTERRUPT`: it has an `IrqHandler`.
+const NVME_ARG0_INTERRUPT: usize = 1;
 const VOLUME_ELF: &[u8] = include_bytes!("../../assets/volume.elf");
 const INFERENCE_SERVICE_ELF: &[u8] = include_bytes!("../../assets/inference-service.elf");
 const RNG_DRIVER_ELF: &[u8] = include_bytes!("../../assets/rng-driver.elf");
@@ -294,8 +298,67 @@ const BIT_ASK_CANCELLED: u64 = 1 << 6;
 const BIT_TIMED_OUT: u64 = 1 << 4;
 const ANSWER_BADGES: [u64; 4] = [1 << 0, 1 << 1, 1 << 2, 1 << 3];
 
-const UART_PADDR: usize = 0x1000_0000;
-const UART_LINE: u16 = 10;
+/// The console UART's page and interrupt line, from the device tree (RFC-0039).
+fn uart_page() -> usize {
+    crate::platform::get().uart.base as usize & !0xfff
+}
+
+fn uart_line() -> u16 {
+    u16::try_from(crate::platform::get().uart.irq).expect("the console's interrupt line is out of range")
+}
+
+/// The shell's `arg0`: the UART's layout, in `lantern_abi::console::UartLayout`'s encoding, which this must match.
+fn shell_arg0() -> usize {
+    let uart = crate::platform::get().uart;
+    (uart.reg_shift as usize & 0b11)
+        | ((uart.io_width == 4) as usize) << 2
+        | (uart.xscale as usize) << 3
+        | (uart.base as usize & 0xfff) << 12
+}
+
+/// The machine's disk, and so which driver serves it (RFC-0039).
+#[derive(Clone, Copy)]
+enum Disk {
+    Virtio { paddr: usize, line: u16 },
+    Nvme { paddr: usize, size: usize, line: Option<u16> },
+}
+
+impl Disk {
+    fn line(self) -> Option<u16> {
+        match self {
+            Disk::Virtio { line, .. } => Some(line),
+            Disk::Nvme { line, .. } => line,
+        }
+    }
+
+    fn elf(self) -> &'static [u8] {
+        match self {
+            Disk::Virtio { .. } => BLK_DRIVER_ELF,
+            Disk::Nvme { .. } => NVME_DRIVER_ELF,
+        }
+    }
+
+    fn arg0(self) -> usize {
+        match self {
+            Disk::Nvme { line: Some(_), .. } => NVME_ARG0_INTERRUPT,
+            _ => 0,
+        }
+    }
+
+    fn paddr(self) -> usize {
+        match self {
+            Disk::Virtio { paddr, .. } | Disk::Nvme { paddr, .. } => paddr,
+        }
+    }
+
+    /// The register pages its driver maps: virtio-mmio's one, or an NVMe controller's registers and first doorbells.
+    fn register_pages(self) -> usize {
+        match self {
+            Disk::Virtio { .. } => 1,
+            Disk::Nvme { size, .. } => 2.min(size / 0x1000),
+        }
+    }
+}
 
 /// # Safety
 /// Must be called at most once, before any trap has occurred.
@@ -307,9 +370,9 @@ pub unsafe fn run(mem_end: usize) -> ! {
     state.tcbs.get_mut(root.0 as usize).unwrap().cspace = Some(CNodeId(root_cnode_idx as u16));
     *state.cnodes.get_mut(root_cnode_idx).unwrap().slot_mut(SELF_CNODE_CPTR).unwrap() =
         Capability::CNode(CNodeId(root_cnode_idx as u16));
-    let mem_end = mem_end.max(pmm::GENERAL_MEMORY_BASE + lantern_hal::RISCV64_MEGAPAGE_SIZE)
+    let mem_end = mem_end.max(pmm::general_memory_base() + lantern_hal::RISCV64_MEGAPAGE_SIZE)
         & !(lantern_hal::RISCV64_MEGAPAGE_SIZE - 1);
-    let untyped = Untyped::with_memory(1000, pmm::GENERAL_MEMORY_BASE, mem_end - pmm::GENERAL_MEMORY_BASE);
+    let untyped = Untyped::with_memory(1000, pmm::general_memory_base(), mem_end - pmm::general_memory_base());
     let untyped_idx = state.untypeds.alloc(untyped).expect("untyped pool exhausted");
     let untyped_cptr: CPtr = 1;
     *state.cnodes.get_mut(root_cnode_idx).unwrap().slot_mut(untyped_cptr).unwrap() =
@@ -367,11 +430,20 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let archiver_endpoint = retype(state, &mut next_slot, ObjectType::Endpoint);
     let archiver_wake = mint(state, &mut next_slot, archiver_endpoint, Rights::WRITE, ARCHIVER_WAKE_BADGE);
     let archiver_reader = mint(state, &mut next_slot, archiver_endpoint, Rights::WRITE, ARCHIVER_READER_BADGE);
-    let (blk_paddr, blk_line) = launch::find_virtio_blk().expect("no virtio-blk device: this image needs a disk");
+    // RFC-0039: the disk is an NVMe controller's, if the machine has one, otherwise a virtio-blk device's.
+    let disk = match launch::find_nvme() {
+        Some((paddr, size, line)) => Disk::Nvme { paddr, size, line },
+        None => {
+            let (paddr, line) = launch::find_virtio_blk().expect("no NVMe or virtio-blk disk: this image needs a disk");
+            Disk::Virtio { paddr, line }
+        }
+    };
     let driver_notification = retype(state, &mut next_slot, ObjectType::Notification);
     let driver_notify = mint(state, &mut next_slot, driver_notification, Rights::ALL, 1);
     let driver_irq = slot(&mut next_slot);
-    launch::irq_handler(state, root, blk_line, driver_irq);
+    if let Some(line) = disk.line() {
+        launch::irq_handler(state, root, line, driver_irq);
+    }
     let driver_dma = slot(&mut next_slot);
     launch::dma_untyped(state, root, untyped_cptr, driver_dma, DMA_BYTES);
     // The binder's endpoint: the shell's control badge, the launcher's registration badge, and one per app slot.
@@ -432,7 +504,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
     let binder_deadline = slot(&mut next_slot);
     launch::deadline(state, root, binder_deadline);
     let irq = slot(&mut next_slot);
-    launch::irq_handler(state, root, UART_LINE, irq);
+    launch::irq_handler(state, root, uart_line(), irq);
     // The launcher's notification (all of it is the launcher's), the shell's badge on it, and the apps' memory.
     let launcher_notify = retype(state, &mut next_slot, ObjectType::Notification);
     let command_bit = mint(state, &mut next_slot, launcher_notify, Rights::WRITE, LAUNCHER_COMMAND_BIT);
@@ -496,10 +568,19 @@ pub unsafe fn run(mem_end: usize) -> ! {
             &grants[..2]
         }
     }
+    let disk_grants = [
+        (driver_endpoint, DRIVER_ENDPOINT),
+        (driver_irq, DRIVER_IRQ),
+        (driver_notify, DRIVER_NOTIFY),
+        (driver_dma, DRIVER_DMA),
+        (system_failed_bit, DRIVER_FAILURE),
+    ];
+    let disk_grants_polled =
+        [(driver_endpoint, DRIVER_ENDPOINT), (driver_notify, DRIVER_NOTIFY), (driver_dma, DRIVER_DMA), (system_failed_bit, DRIVER_FAILURE)];
     let specs = [
         ProgramSpec {
             elf_bytes: SHELL_ELF,
-            arg0: 0,
+            arg0: shell_arg0(),
             grants: &shell_grants,
             self_cnode_dest: None,
             heap_megapages: 0,
@@ -570,15 +651,9 @@ pub unsafe fn run(mem_end: usize) -> ! {
             arena: None,
         },
         ProgramSpec {
-            elf_bytes: BLK_DRIVER_ELF,
-            arg0: 0,
-            grants: &[
-                (driver_endpoint, DRIVER_ENDPOINT),
-                (driver_irq, DRIVER_IRQ),
-                (driver_notify, DRIVER_NOTIFY),
-                (driver_dma, DRIVER_DMA),
-                (system_failed_bit, DRIVER_FAILURE),
-            ],
+            elf_bytes: disk.elf(),
+            arg0: disk.arg0(),
+            grants: if disk.line().is_some() { &disk_grants } else { &disk_grants_polled },
             self_cnode_dest: None,
             heap_megapages: 0,
             arena: Some(ArenaGrant { megapages: 0, self_vspace_dest: DRIVER_SELF_VSPACE, frame_dest_base: 0 }),
@@ -668,7 +743,7 @@ pub unsafe fn run(mem_end: usize) -> ! {
     ];
     let [shell, keystore, store, binder, launcher, policy_store, driver, volume, inference, rng_driver, net_driver, net, wallet, archiver] =
         launch::load_all(state, root, untyped_cptr, &specs, &mut next_slot);
-    launch::map_small_device_frame(state, root, UART_PADDR, shell.vspace_cptr, SHELL_UART_VADDR, &mut next_slot);
+    launch::map_small_device_frame(state, root, uart_page(), shell.vspace_cptr, SHELL_UART_VADDR, &mut next_slot);
     // The runtime's ELF, the launcher's alone. The packages are on the disk.
     launch::map_set(state, root, untyped_cptr, &[CONFINED_RUNTIME_ELF], &[launcher.vspace_cptr], LAUNCHER_RUNTIME_VADDR, &mut next_slot);
     // Each app slot's channels, in their services for good.
@@ -724,7 +799,10 @@ pub unsafe fn run(mem_end: usize) -> ! {
         &mut next_slot,
     );
     // RFC-0031: the disk's register page and every channel to and from the volume.
-    launch::map_small_device_frame(state, root, blk_paddr, driver.vspace_cptr, DRIVER_REGS_VADDR, &mut next_slot);
+    for page in 0..disk.register_pages() {
+        let (paddr, vaddr) = (disk.paddr() + page * 0x1000, DRIVER_REGS_VADDR + page * 0x1000);
+        launch::map_small_device_frame(state, root, paddr, driver.vspace_cptr, vaddr, &mut next_slot);
+    }
     let mut share = |state: &mut _, a, a_vaddr, b, b_vaddr| {
         launch::map_shared_frame(state, root, untyped_cptr, a, a_vaddr, b, b_vaddr, &mut next_slot)
     };
