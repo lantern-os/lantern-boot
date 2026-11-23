@@ -13,6 +13,8 @@ mod elf;
 
 #[path = "../fdt.rs"]
 mod fdt;
+#[path = "../platform.rs"]
+mod platform;
 #[cfg(target_arch = "riscv64")]
 #[path = "../entry.rs"]
 mod entry;
@@ -72,17 +74,9 @@ extern "C" fn boot_main(hartid: usize, dtb: usize) -> ! {
     println!("hartid={hartid} dtb={dtb:#x}");
 
     // SAFETY: `dtb` is the FDT pointer OpenSBI passed in `a1`.
-    let mem_end = match unsafe { fdt::ram_region(dtb as *const u8) } {
-        Some((base, size)) => {
-            let end = base.saturating_add(size) as usize;
-            println!("boot: DTB reports RAM {base:#x}..{end:#x}");
-            end
-        }
-        None => {
-            println!("boot: DTB unreadable, using the hardcoded RAM end {:#x}", pmm::GENERAL_MEMORY_END);
-            pmm::GENERAL_MEMORY_END
-        }
-    };
+    // SAFETY: first thing, with the hart and device tree the firmware passed.
+    unsafe { platform::discover(hartid, dtb) };
+    let mem_end = pmm::general_memory_end();
 
     // SAFETY: called exactly once, here, before any trap can occur.
     unsafe {

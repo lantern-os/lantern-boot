@@ -46,7 +46,7 @@ run_demo() {
     local out="$WORK/qemu.out"
     local drive=(-drive "if=pflash,format=raw,unit=1,file=$IMAGE")
     [ -n "${NO_FLASH:-}" ] && drive=()
-    qemu-system-riscv64 -machine virt -bios default -nographic -m 128M "${drive[@]}" -kernel "$1" </dev/null >"$out" 2>&1 &
+    qemu-system-riscv64 -machine "${MACHINE:-virt}" ${SMP:+-smp "$SMP"} ${CPU:+-cpu "$CPU"} -bios default -nographic -m 128M "${drive[@]}" -kernel "$1" </dev/null >"$out" 2>&1 &
     local pid=$!
     for _ in $(seq 1 900); do
         grep -aq "Signal'd" "$out" && break

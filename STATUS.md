@@ -5,6 +5,12 @@
 **Roadmap:** Phase 3 closed and Phase 4 (hardware and assurance) opened, 2026-11-16, per [RFC-0036](../lantern-rfcs/rfcs/0036-phase-3-to-phase-4-transition.md)/[ADR-0041](../lantern-rfcs/adr/0041-phase-3-complete-phase-4-opened.md).
 
 ## Done
+- **Bring-up groundwork for the K3 Pico-ITX, in QEMU (2026-11-23, [RFC-0039](../lantern-rfcs/rfcs/0039-bring-up-on-the-k3-pico-itx.md), Draft: the board half remains).** Boot reads the
+  machine from the device tree (`src/fdt.rs`, `src/platform.rs`, fixtures in `testdata/`), prints through SBI until it has,
+  boots on any hart, and links position-independent, relocating itself (`build.rs`, `src/entry.rs`). The EFI loader puts
+  the kernel in the lowest free range, copies the device tree before `ExitBootServices`, and hands over what the firmware
+  keeps. NVMe on an ECAM PCIe host (`launch::find_nvme`, new `nvme-driver/`), preferred over virtio-blk. Scripts take
+  `MACHINE`, `SMP`, `CPU`, `DISK_BUS`; new `scripts/any-hart.sh` and `scripts/board-run.sh`.
 - **Signed models and the archive (2026-11-19, [RFC-0038](../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md)/[ADR-0043](../lantern-rfcs/adr/0043-signed-models-and-kept-audit-history.md)).** The inference service accepts only a model package a trusted
   publisher signed (`assets/model.digest` removed); `tools/mkmodel` signs, and can `--repackage`; `get-model.sh` pins
   the conversion's digest and makes `stories15M.lmod`. The system image adds the archiver, and `lantern-mkdisk` an 18

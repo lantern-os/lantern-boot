@@ -11,6 +11,10 @@
 #
 # QEMU's `virt` gives ACPI tables by default, and EDK2 then gives no device tree; LanternOS needs one, so `acpi=off`.
 set -u
+# RFC-0039: DISK_BUS=nvme puts the disk on an NVMe controller on QEMU's PCIe bus instead of virtio-mmio.
+disk_device() {
+    if [ "${DISK_BUS:-virtio}" = nvme ]; then echo "-device nvme,serial=lantern,drive=disk"; else echo "-device virtio-blk-device,drive=disk"; fi
+}
 cd "$(dirname "$0")/.." || exit 2
 CODE="${EDK2_CODE:-/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd}"
 VARS_TEMPLATE="${EDK2_VARS:-/usr/share/qemu-efi-riscv64/RISCV_VIRT_VARS.fd}"
@@ -41,10 +45,10 @@ fail() {
 boot() {
     rm -f "$WORK/in"
     mkfifo "$WORK/in"
-    qemu-system-riscv64 -machine virt,acpi=off -m 256M -nographic \
+    qemu-system-riscv64 -machine "${MACHINE:-virt}",acpi=off ${SMP:+-smp "$SMP"} ${CPU:+-cpu "$CPU"} -m 256M -nographic \
         -drive "if=pflash,unit=0,format=raw,readonly=on,file=$CODE" -drive "if=pflash,unit=1,format=raw,file=$WORK/vars.fd" \
         -global virtio-mmio.force-legacy=false -drive "if=none,format=raw,file=$WORK/disk.img,id=disk" \
-        -device virtio-blk-device,drive=disk <"$WORK/in" >"$WORK/out" 2>&1 &
+        $(disk_device) <"$WORK/in" >"$WORK/out" 2>&1 &
     QEMU_PID=$!
     exec 3>"$WORK/in"
 }
@@ -107,6 +111,9 @@ done
 expect "$AGENT_DONE" && printf 'read 2\r' >&3 && expect "  $CONTINUED"
 stop
 grep -aq 'PANIC' "$WORK/out" && fail 'a panic'
+# RFC-0039: the loader handed over what EDK2 keeps after ExitBootServices, and boot reserved it.
+kept=$(grep -a -o 'the firmware keeps [0-9]* ranges' "$WORK/out" | head -1 | awk '{ print $4 }')
+[ "${kept:-0}" -gt 0 ] || fail "want the firmware's reserved ranges handed over, got ${kept:-none}"
 # Three writes: the app's, the person's, the assistant's.
 [ "$(store_seq)" = 3 ] || fail "want the store's third image on the disk, got $(store_seq)"
 [ "$failures" = 0 ] && printf 'ok    %s\n' "$CASE"
@@ -123,5 +130,26 @@ stop
 grep -aqF "$PROMPT" "$WORK/out" && fail 'asked again: the decision was lost'
 [ "$(store_seq)" = 5 ] || fail "want the store's fifth image, got $(store_seq)"
 [ "$failures" = "$before" ] && printf 'ok    %s\n' "$CASE"
+
+# RFC-0039: the same image, loaded away from its link address, relocates itself. A loader built `place-high` takes
+# wherever EDK2's allocator puts it, high in RAM, instead of the lowest free range, which here is the link address.
+CASE='a kernel loaded away from its link address relocates itself'
+before=$failures
+(cd efi-loader && cargo build -q --release --features place-high) || exit 2
+(cd tools/elf2efi && cargo run -q --target "$HOST" -- ../../efi-loader/$TARGET/lantern-efi-loader "$WORK/BOOTRISCV64.EFI") || exit 2
+(cd tools/mkdisk && cargo run -q --target "$HOST" -- --out "$WORK/disk.img" --bootable --loader "$WORK/BOOTRISCV64.EFI" \
+    --boot-image "$OLDPWD/$TARGET/lantern-boot-system" --package "$OLDPWD/assets/probe.lpkg" \
+    --package "$OLDPWD/assets/fs-probe.lpkg" --package "$OLDPWD/assets/file-assistant.lpkg" --model "$MODEL") >/dev/null || exit 2
+cp "$VARS_TEMPLATE" "$WORK/vars.fd"
+boot
+expect 'Type help for commands.'
+printf 'run confined-fs-probe\r' >&3
+expect "$PROMPT" && printf 'a\r' >&3 && expect "$DONE"
+stop
+at=$(grep -a -o 'running at 0x[0-9a-f]*' "$WORK/out" | head -1 | awk '{ print $3 }')
+[ -n "$at" ] && [ "$at" != 0x80200000 ] || fail "want the kernel away from its link address, got ${at:-nothing}"
+grep -aq 'PANIC' "$WORK/out" && fail 'a panic'
+(cd efi-loader && cargo build -q --release) || exit 2
+[ "$failures" = "$before" ] && printf 'ok    %s (at %s)\n' "$CASE" "$at"
 
 [ "$failures" -eq 0 ] && echo 'all passed' || { echo "$failures failed"; exit 1; }

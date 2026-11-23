@@ -21,7 +21,7 @@ failures=0
 run() {
     local label=$1 features=$2 check_idle=$3
     cargo build -q --release --bin lantern-boot-deadline-demo ${features:+--features "$features"} || exit 2
-    qemu-system-riscv64 -machine virt -bios default -nographic -m 128M \
+    qemu-system-riscv64 -machine "${MACHINE:-virt}" ${SMP:+-smp "$SMP"} ${CPU:+-cpu "$CPU"} -bios default -nographic -m 128M \
         -kernel "$TARGET/lantern-boot-deadline-demo" </dev/null >"$WORK/out" 2>&1 &
     local qemu=$!
     sleep 0.5

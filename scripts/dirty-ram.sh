@@ -17,7 +17,7 @@ for demo in frame broker keystore store wasm-probe runtime runtime-fs lifecycle;
     cargo build -q --release --bin "lantern-boot-$demo-demo" || exit 2
     cp "$WORK/flash.img" "$WORK/run.img"
     out="$WORK/qemu.out"
-    qemu-system-riscv64 -machine virt -bios default -nographic -m 128M \
+    qemu-system-riscv64 -machine "${MACHINE:-virt}" ${SMP:+-smp "$SMP"} ${CPU:+-cpu "$CPU"} -bios default -nographic -m 128M \
         -device "loader,file=$WORK/dirty.bin,addr=0x80600000,force-raw=on" \
         -drive "if=pflash,format=raw,unit=1,file=$WORK/run.img" \
         -kernel "$TARGET/lantern-boot-$demo-demo" </dev/null >"$out" 2>&1 &

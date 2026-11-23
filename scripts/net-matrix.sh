@@ -76,7 +76,7 @@ boot() {
     [ "${1:-}" = no-net ] && devices=()
     rm -f "$WORK/in"
     mkfifo "$WORK/in"
-    qemu-system-riscv64 -machine virt -bios default -nographic -m 256M "${devices[@]}" \
+    qemu-system-riscv64 -machine "${MACHINE:-virt}" ${SMP:+-smp "$SMP"} ${CPU:+-cpu "$CPU"} -bios default -nographic -m 256M "${devices[@]}" \
         -global virtio-mmio.force-legacy=false -drive "if=none,format=raw,file=$DISK,id=disk" -device virtio-blk-device,drive=disk \
         -kernel "$TARGET/lantern-boot-system" <"$WORK/in" >"$WORK/out" 2>&1 &
     QEMU_PID=$!

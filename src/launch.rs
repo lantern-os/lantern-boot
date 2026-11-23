@@ -361,17 +361,8 @@ pub fn delete(state: &mut KernelState, root: TcbId, slot: CPtr) {
     cnode::invoke(state, root, SELF_CNODE_CPTR, &mut frame).expect("launcher delete must succeed");
 }
 
-/// Where OpenSBI loads/enters this image (`linker.ld`'s `BASE_ADDRESS`) — the
-/// megapages every loaded program's VSpace needs mapped, S-mode-only, for
-/// the trap vector/kernel dispatch/`sret` cold-start path to keep working once
-/// that program's own table is active (RISC-V traps don't switch page
-/// tables). Two of them, which `linker.ld` asserts the image fits; they end at
-/// `pmm::GENERAL_MEMORY_BASE`.
-const KERNEL_MEGAPAGE_BASE: usize = 0x8020_0000;
-const KERNEL_MEGAPAGE_2_BASE: usize = 0x8040_0000;
-const UART_MEGAPAGE_BASE: usize = 0x1000_0000;
-/// QEMU `virt`'s PLIC: 4 MiB from here, S-mode-only, as `lantern_hal`'s `riscv64` interrupt path expects (RFC-0027).
-const PLIC_MEGAPAGE_BASE: usize = 0x0c00_0000;
+/// The most megapages an interrupt controller's registers may span in the kernel template: QEMU's PLIC takes 3.
+const MAX_INTC_MEGAPAGES: u64 = 4;
 
 /// Maps `frame_cptr` (in `root`'s CSpace) into `vspace_cptr`'s (also `root`'s
 /// CSpace) VSpace at `vaddr`, with `perms` (see `PERM_*` above).
@@ -397,15 +388,28 @@ pub fn register_kernel_template(state: &mut KernelState) {
         .union(lantern_hal::Riscv64PteFlags::EXECUTE);
     let mmio_flags = lantern_hal::Riscv64PteFlags::READ.union(lantern_hal::Riscv64PteFlags::WRITE);
     let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
-    for &(base, flags) in &[
-        (KERNEL_MEGAPAGE_BASE, kernel_flags),
-        (KERNEL_MEGAPAGE_2_BASE, kernel_flags),
-        (UART_MEGAPAGE_BASE, mmio_flags),
-        // RFC-0027: the PLIC's priorities and enables, then its threshold and claim, for the kernel's interrupt path.
-        (PLIC_MEGAPAGE_BASE, mmio_flags),
-        (PLIC_MEGAPAGE_BASE + mega, mmio_flags),
-    ] {
+    let platform = crate::platform::get();
+    // This image's two megapages, where the firmware put it (`linker.ld`): the trap vector, kernel dispatch and the
+    // `sret` cold-start path need them mapped once a program's own table is active, since RISC-V traps don't switch
+    // page tables.
+    let kernel = crate::platform::kernel_base();
+    let mut add = |base: usize, flags| {
         assert!(lantern_kernel::vspace::add_kernel_megapage(state, base, base, flags), "kernel template full");
+    };
+    add(kernel, kernel_flags);
+    add(kernel + mega, kernel_flags);
+    // Boot's console UART, from the device tree (RFC-0039).
+    add(platform.uart.base as usize & !(mega - 1), mmio_flags);
+    // RFC-0027/RFC-0039: the interrupt controller's registers, for the kernel's interrupt path.
+    let (intc_base, intc_size) = match platform.intc {
+        crate::platform::Intc::Plic { base, size, .. } => (base, size),
+        crate::platform::Intc::Aia { aplic_base, aplic_size, .. } => (aplic_base, aplic_size),
+    };
+    let first = intc_base & !(mega as u64 - 1);
+    let count = (intc_base + intc_size - first).div_ceil(mega as u64);
+    assert!(count <= MAX_INTC_MEGAPAGES, "the interrupt controller spans too much to map");
+    for i in 0..count {
+        add((first + i * mega as u64) as usize, mmio_flags);
     }
     assert!(lantern_kernel::vspace::install_direct_map(state), "no page tables for the direct map");
 }
@@ -711,9 +715,10 @@ pub fn map_package(
     delete(state, root, frame_cptr);
 }
 
-/// [RFC-0031](../../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md): the first virtio-mmio slot on
-/// QEMU `virt` holding a modern (version 2) block device: its register page's physical address and its interrupt line.
-/// Boot reads only each slot's magic, version and device ID; the driver does everything else.
+/// [RFC-0031](../../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md): the first virtio-mmio slot the
+/// device tree lists, lowest address first, holding a modern (version 2) block device: its register page's physical
+/// address and its interrupt line. Boot reads only each slot's magic, version and device ID; the driver does everything
+/// else.
 #[allow(dead_code)]
 pub fn find_virtio_blk() -> Option<(usize, u16)> {
     find_virtio(2)
@@ -723,15 +728,104 @@ pub fn find_virtio_blk() -> Option<(usize, u16)> {
 /// ([RFC-0035](../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md)).
 #[allow(dead_code)]
 pub fn find_virtio(device_id: u32) -> Option<(usize, u16)> {
-    const FIRST: usize = 0x1000_1000;
-    const SLOTS: usize = 8;
-    (0..SLOTS).find_map(|i| {
-        let base = FIRST + i * 0x1000;
-        // SAFETY: QEMU `virt`'s virtio-mmio slots, read in boot's identity-mapped S-mode before any program runs. Reading
-        // these registers has no side effect.
+    crate::platform::get().virtio().iter().find_map(|slot| {
+        let base = slot.base as usize;
+        let line = u16::try_from(slot.irq).ok()?;
+        // SAFETY: a `virtio,mmio` node's registers from the device tree, read in boot's identity-mapped S-mode before any
+        // program runs. Reading these registers has no side effect.
         let read = |offset: usize| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
-        (read(0) == 0x7472_6976 && read(4) == 2 && read(8) == device_id).then_some((base, 1 + i as u16))
+        (read(0) == 0x7472_6976 && read(4) == 2 && read(8) == device_id).then_some((base, line))
     })
+}
+
+/// [RFC-0039](../../lantern-rfcs/rfcs/0039-bring-up-on-the-k3-pico-itx.md) §4: an NVMe controller on the PCIe host's root
+/// bus, its registers ready: BAR0, its 64-bit memory BAR, at an address in the host's memory window (the firmware's, if
+/// it assigned one, otherwise the window's start), and memory decoding and bus mastering on. Its registers' physical
+/// address and size, and its INTx line, if the host routes one to the interrupt controller.
+///
+/// Boot writes only this function's BAR0 and command register; the driver does everything else. QEMU `virt`'s ECAM
+/// host; a DesignWare host (the K3's) needs its own set-up first.
+#[allow(dead_code)]
+pub fn find_nvme() -> Option<(usize, usize, Option<u16>)> {
+    let pci = crate::platform::get().pci?;
+    const CLASS_NVME: u32 = 0x01_08_02;
+    for device in 0..32u32 {
+        for function in 0..8u32 {
+            let config = pci.ecam.base as usize + ((pci.bus_first << 20 | device << 15 | function << 12) as usize);
+            if config + 0x1000 > (pci.ecam.base + pci.ecam.size) as usize {
+                return None;
+            }
+            let reg = |offset: usize| (config + offset) as *mut u32;
+            // SAFETY: the host's ECAM space from the device tree, identity-reachable in boot's S-mode before any program
+            // runs; reading a function's ID and class has no side effect.
+            let (id, class, header) = unsafe {
+                (core::ptr::read_volatile(reg(0)), core::ptr::read_volatile(reg(8)) >> 8, core::ptr::read_volatile(reg(0xc)))
+            };
+            if id & 0xffff == 0xffff {
+                if function == 0 {
+                    break;
+                }
+                continue;
+            }
+            if class == CLASS_NVME {
+                return nvme_bar(&pci, reg, device, function);
+            }
+            // Not multi-function: no functions past 0.
+            if function == 0 && header & (1 << 23) == 0 {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Sizes and, if need be, assigns `reg`'s function's BAR0, then turns on memory decoding and bus mastering.
+fn nvme_bar(
+    pci: &crate::platform::PciHost,
+    reg: impl Fn(usize) -> *mut u32,
+    device: u32,
+    function: u32,
+) -> Option<(usize, usize, Option<u16>)> {
+    const COMMAND: usize = 0x04;
+    const BAR0: usize = 0x10;
+    const COMMAND_MEMORY: u32 = 1 << 1;
+    const COMMAND_BUS_MASTER: u32 = 1 << 2;
+    // SAFETY: this function's own configuration registers, as `find_nvme`'s; decoding is off while BAR0 is sized.
+    unsafe {
+        let command = core::ptr::read_volatile(reg(COMMAND));
+        core::ptr::write_volatile(reg(COMMAND), command & !(COMMAND_MEMORY | COMMAND_BUS_MASTER));
+        let (lo, hi) = (core::ptr::read_volatile(reg(BAR0)), core::ptr::read_volatile(reg(BAR0 + 4)));
+        // A 64-bit memory BAR, as NVMe's is: bit 0 clear (memory), bits 2:1 = 2 (64-bit).
+        if lo & 1 != 0 || (lo >> 1) & 3 != 2 {
+            return None;
+        }
+        core::ptr::write_volatile(reg(BAR0), u32::MAX);
+        core::ptr::write_volatile(reg(BAR0 + 4), u32::MAX);
+        let mask = (core::ptr::read_volatile(reg(BAR0 + 4)) as u64) << 32 | (core::ptr::read_volatile(reg(BAR0)) & !0xf) as u64;
+        let size = (!mask).wrapping_add(1);
+        let firmware = (hi as u64) << 32 | (lo & !0xf) as u64;
+        // The firmware's assignment, in whichever window holds it; otherwise the 32-bit window's start.
+        let inside =
+            |w: &crate::platform::Window, bus: u64| bus >= w.pci && bus.checked_add(size).is_some_and(|e| e <= w.pci + w.size);
+        let chosen = if firmware != 0 {
+            [pci.mem32, pci.mem64].into_iter().flatten().find(|w| inside(w, firmware)).map(|w| (w, firmware))
+        } else {
+            pci.mem32.and_then(|w| Some((w, w.pci.checked_add(size - 1)? & !(size - 1))))
+        };
+        let valid = size >= 0x2000 && size.is_power_of_two();
+        let Some((window, bus)) = chosen.filter(|(w, bus)| valid && inside(w, *bus)) else {
+            core::ptr::write_volatile(reg(BAR0), lo);
+            core::ptr::write_volatile(reg(BAR0 + 4), hi);
+            return None;
+        };
+        core::ptr::write_volatile(reg(BAR0), bus as u32 | (lo & 0xf));
+        core::ptr::write_volatile(reg(BAR0 + 4), (bus >> 32) as u32);
+        core::ptr::write_volatile(reg(COMMAND), command | COMMAND_MEMORY | COMMAND_BUS_MASTER);
+        let pin = (core::ptr::read_volatile(reg(0x3c)) >> 8) & 0xff;
+        let line = (pin != 0).then(|| pci.intx_line(pci.bus_first, device, function, pin)).flatten();
+        let cpu = window.cpu + (bus - window.pci);
+        Some((cpu as usize, size as usize, line.and_then(|l| u16::try_from(l).ok())))
+    }
 }
 
 /// Carves `bytes` from `untyped_cptr` into a new `Untyped` at `dest` that boot marks for DMA: a Frame retyped from it
